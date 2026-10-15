@@ -1,0 +1,3773 @@
+"""Bot Telegram bán tài khoản độc lập, dùng danh mục sản phẩm của website.
+
+Khách chỉ cần Telegram, không cần đăng nhập website:
+    /start -> chọn sản phẩm -> nạp tiền -> bot tự động xử lý và gửi tài khoản.
+
+Bot gọi backend website bằng shared secret server-to-server. Không đặt bot token,
+Firebase secret hoặc API key nhà cung cấp vào mã nguồn.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import html
+import hmac
+import json
+import logging
+import os
+import re
+import secrets
+import sqlite3
+import time
+from collections import defaultdict
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote, urljoin
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+import httpx
+import uvicorn
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import (
+    BotCommand,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    FSInputFile,
+    URLInputFile,
+)
+from dotenv import load_dotenv
+from fastapi import FastAPI, Request
+
+
+# ---------------------------------------------------------------------------
+# Cấu hình
+# ---------------------------------------------------------------------------
+
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+WEB_API_BASE_URL = os.getenv("WEB_API_BASE_URL", "").strip().rstrip("/")
+TELEGRAM_BOT_SHARED_SECRET = os.getenv("TELEGRAM_BOT_SHARED_SECRET", "").strip()
+
+
+def parse_admin_ids() -> set[int]:
+    raw_values = [os.getenv("ADMIN_TELEGRAM_ID", ""), os.getenv("ADMIN_TELEGRAM_IDS", "")]
+    admin_ids: set[int] = set()
+    for raw_value in raw_values:
+        for value in re.split(r"[,;\s]+", raw_value or ""):
+            value = value.strip().strip("'\"")
+            if value.isdigit():
+                admin_ids.add(int(value))
+    return admin_ids
+
+
+ADMIN_TELEGRAM_IDS = parse_admin_ids()
+ADMIN_TELEGRAM_ID = min(ADMIN_TELEGRAM_IDS) if ADMIN_TELEGRAM_IDS else 0
+DATA_DIR = Path(os.getenv("BOT_DATA_DIR", str(BASE_DIR)))
+DB_PATH = DATA_DIR / "telegram_shop.sqlite3"
+BACKUP_DIR = Path(os.getenv("BOT_BACKUP_DIR", "").strip() or str(DATA_DIR / "backups"))
+BACKUP_KEEP = max(1, int(os.getenv("BOT_BACKUP_KEEP", "14")))
+BACKUP_INTERVAL_SECONDS = max(300, int(os.getenv("BOT_BACKUP_INTERVAL_SECONDS", "21600")))
+BACKUP_DAILY_TIME = os.getenv("BOT_BACKUP_DAILY_TIME", "23:00").strip() or "23:00"
+BACKUP_TIMEZONE = os.getenv("BOT_BACKUP_TIMEZONE", "Asia/Ho_Chi_Minh").strip() or "Asia/Ho_Chi_Minh"
+PORT = int(os.getenv("PORT", "8000"))
+WEBHOOK_TOKEN = os.getenv("SEPAY_WEBHOOK_TOKEN", "").strip()
+SEPAY_FORWARD_URL = os.getenv("SEPAY_FORWARD_URL", "").strip().rstrip("/")
+
+CATALOG_PAGE_SIZE = max(1, min(20, int(os.getenv("CATALOG_PAGE_SIZE", "8"))))
+MAX_QUANTITY = max(1, min(100, int(os.getenv("MAX_QUANTITY", "100"))))
+MIN_DEPOSIT = max(0, int(os.getenv("MIN_DEPOSIT", "0")))
+DEPOSIT_WATCH_SECONDS = max(60, int(os.getenv("DEPOSIT_WATCH_SECONDS", "900")))
+DEPOSIT_POLL_SECONDS = max(3, int(os.getenv("DEPOSIT_POLL_SECONDS", "5")))
+CATALOG_CACHE_TTL_SECONDS = 8
+PROVIDER_STOCK_POLL_SECONDS = max(30, int(os.getenv("PROVIDER_STOCK_POLL_SECONDS", "60")))
+SUPPORT_HANDLE = os.getenv("SUPPORT_TELEGRAM", "@tai_khoan_xin").strip() or "@tai_khoan_xin"
+HTTP_TIMEOUT = httpx.Timeout(20.0, connect=8.0)
+HTTP_LIMITS = httpx.Limits(max_connections=100, max_keepalive_connections=20, keepalive_expiry=30.0)
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+LOGGER = logging.getLogger("telegram-account-shop")
+
+
+class DepositStates(StatesGroup):
+    amount = State()
+
+
+class QuantityStates(StatesGroup):
+    quantity = State()
+
+
+class AdminStates(StatesGroup):
+    broadcast = State()
+    confirm_broadcast = State()
+    product_badge = State()
+    balance_target = State()
+    balance_action = State()
+    balance_amount = State()
+    balance_note = State()
+    balance_confirm = State()
+
+
+class ApiError(RuntimeError):
+    def __init__(self, status: int, code: str, message: str):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.message = message
+
+
+class WebApi:
+    """Client gọi các endpoint API đã thêm vào web_test."""
+
+    def __init__(self, base_url: str, shared_secret: str):
+        self.base_url = base_url.rstrip("/")
+        self.shared_secret = shared_secret
+        self.catalog_cache: dict[bool, tuple[float, dict[str, Any]]] = {}
+        self.catalog_lock = asyncio.Lock()
+        self.balance_cache: dict[int, tuple[float, dict[str, Any]]] = {}
+        self.client = httpx.AsyncClient(
+            timeout=HTTP_TIMEOUT,
+            limits=HTTP_LIMITS,
+            follow_redirects=True,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "TaiKhoanXin-TelegramBot/2.0",
+            },
+        )
+
+    async def close(self) -> None:
+        await self.client.aclose()
+
+    def headers(self, telegram_id: int | str | None = None) -> dict[str, str]:
+        headers = {
+            "X-Telegram-Bot-Secret": self.shared_secret,
+        }
+        if telegram_id is not None:
+            headers["X-Telegram-User-Id"] = str(telegram_id)
+        return headers
+
+    async def request(
+        self,
+        method: str,
+        path: str,
+        telegram_id: int | str | None,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not self.base_url:
+            raise ApiError(500, "BOT_CONFIG_MISSING", "Chưa cấu hình WEB_API_BASE_URL.")
+        if not self.shared_secret:
+            raise ApiError(500, "BOT_CONFIG_MISSING", "Chưa cấu hình TELEGRAM_BOT_SHARED_SECRET.")
+
+        try:
+            response = await self.client.request(
+                method,
+                f"{self.base_url}/{path.lstrip('/')}",
+                headers=self.headers(telegram_id),
+                json=payload,
+            )
+        except httpx.HTTPError as exc:
+            raise ApiError(503, "WEB_UNAVAILABLE", "Không kết nối được website, vui lòng thử lại.") from exc
+
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise ApiError(502, "WEB_INVALID_RESPONSE", "Website trả về dữ liệu không hợp lệ.") from exc
+        if not isinstance(body, dict):
+            raise ApiError(502, "WEB_INVALID_RESPONSE", "Website trả về dữ liệu không hợp lệ.")
+
+        if response.status_code < 200 or response.status_code >= 300 or body.get("success") is False:
+            raise ApiError(
+                response.status_code,
+                str(body.get("code") or "WEB_REQUEST_FAILED"),
+                str(body.get("error") or "Website không thể xử lý yêu cầu."),
+            )
+        data = body.get("data", body)
+        return data if isinstance(data, dict) else {"value": data}
+
+    async def catalog(self, telegram_id: int, *, ctv_mode: bool = False) -> dict[str, Any]:
+        now = time.monotonic()
+        cached_entry = self.catalog_cache.get(ctv_mode)
+        if cached_entry and now - cached_entry[0] < CATALOG_CACHE_TTL_SECONDS:
+            return {**cached_entry[1], "username": f"tg_{telegram_id}", "channel": "telegram"}
+
+        async with self.catalog_lock:
+            now = time.monotonic()
+            cached_entry = self.catalog_cache.get(ctv_mode)
+            if cached_entry and now - cached_entry[0] < CATALOG_CACHE_TTL_SECONDS:
+                return {**cached_entry[1], "username": f"tg_{telegram_id}", "channel": "telegram"}
+            path = "/user/catalog?mode=ctv" if ctv_mode else "/user/catalog"
+            result = await self.request("GET", path, telegram_id)
+            cached = {
+                "products": [dict(item) for item in result.get("products", []) if isinstance(item, dict)],
+                "discountPercent": int(result.get("discountPercent") or 0),
+                "isCtv": bool(result.get("isCtv")),
+            }
+            self.catalog_cache[ctv_mode] = (time.monotonic(), cached)
+            return {**cached, "username": f"tg_{telegram_id}", "channel": "telegram"}
+
+    def invalidate_catalog(self) -> None:
+        self.catalog_cache.clear()
+
+    async def balance(self, telegram_id: int) -> dict[str, Any]:
+        cached = self.balance_cache.get(int(telegram_id))
+        if cached and time.monotonic() - cached[0] < 2:
+            return dict(cached[1])
+        result = await self.request("GET", "/user/balance", telegram_id)
+        self.balance_cache[int(telegram_id)] = (time.monotonic(), dict(result))
+        if len(self.balance_cache) > 2048:
+            self.balance_cache.pop(next(iter(self.balance_cache)))
+        return result
+
+    def invalidate_balance(self, telegram_id: int) -> None:
+        self.balance_cache.pop(int(telegram_id), None)
+
+    async def orders(self, telegram_id: int) -> dict[str, Any]:
+        return await self.request("GET", "/user/orders", telegram_id)
+
+    async def checkout(self, telegram_id: int, product_id: str, order_id: str, quantity: int, *, ctv_mode: bool = False) -> dict[str, Any]:
+        return await self.request(
+            "POST",
+            "/provider/checkout",
+            telegram_id,
+            payload={
+                "productId": product_id,
+                "orderId": order_id,
+                "quantity": quantity,
+                "salesChannel": "ctv" if ctv_mode else "retail",
+            },
+        )
+
+    async def manual_checkout(self, telegram_id: int, product_id: str, order_id: str, quantity: int, *, ctv_mode: bool = False) -> dict[str, Any]:
+        return await self.request(
+            "POST",
+            "/telegram/manual-checkout",
+            telegram_id,
+            payload={
+                "productId": product_id,
+                "orderId": order_id,
+                "quantity": quantity,
+                "salesChannel": "ctv" if ctv_mode else "retail",
+            },
+        )
+
+    async def ctv_status(self, telegram_id: int) -> bool:
+        result = await self.request("GET", "/telegram/ctv/status", telegram_id)
+        return bool(result.get("isCtv"))
+
+    async def order_detail(self, telegram_id: int, order_id: str) -> dict[str, Any]:
+        return await self.request("GET", f"/provider/order/{order_id}", telegram_id)
+
+    async def admin_stats(self, telegram_id: int) -> dict[str, Any]:
+        return await self.request("GET", "/telegram/admin/stats", telegram_id)
+
+    async def product_badges(self, telegram_id: int) -> dict[str, str]:
+        result = await self.request("GET", "/telegram/admin/product-badges", telegram_id)
+        badges = result.get("badges") if isinstance(result.get("badges"), dict) else {}
+        return {str(key): str(value) for key, value in badges.items() if str(value).strip()}
+
+    async def save_product_badge(self, telegram_id: int, product_id: str, badge: str | None) -> None:
+        path = f"/telegram/admin/product-badges/{quote(str(product_id), safe='')}"
+        if badge:
+            await self.request("PUT", path, telegram_id, payload={"badge": badge})
+        else:
+            await self.request("DELETE", path, telegram_id)
+
+    async def update_profile(self, telegram_id: int, display_name: str, username: str) -> None:
+        await self.request(
+            "POST",
+            "/telegram/user/profile",
+            telegram_id,
+            payload={"displayName": display_name, "username": username},
+        )
+
+    async def adjust_member_balance(
+        self,
+        admin_telegram_id: int,
+        target_telegram_id: int,
+        action: str,
+        amount: int,
+        note: str,
+        request_id: str,
+    ) -> dict[str, Any]:
+        return await self.request(
+            "POST",
+            "/telegram/admin/balance-adjust",
+            admin_telegram_id,
+            payload={
+                "telegramId": str(target_telegram_id),
+                "action": action,
+                "amount": amount,
+                "note": note,
+                "requestId": request_id,
+            },
+        )
+
+    async def create_deposit(self, telegram_id: int, amount: int) -> dict[str, Any]:
+        return await self.request("POST", "/telegram/deposit", telegram_id, payload={"amount": amount})
+
+    async def deposit_status(self, telegram_id: int, memo: str) -> dict[str, Any]:
+        return await self.request("GET", f"/telegram/deposit/{memo}", telegram_id)
+
+    async def confirm_deposit(self, telegram_id: int, memo: str, amount: int, transaction_id: str) -> dict[str, Any]:
+        return await self.request(
+            "POST",
+            "/telegram/deposit/confirm",
+            telegram_id,
+            payload={"memo": memo, "amount": amount, "transactionId": transaction_id},
+        )
+
+    async def confirm_deposit_by_memo(self, memo: str, amount: int, transaction_id: str) -> dict[str, Any]:
+        return await self.request(
+            "POST",
+            "/telegram/deposit/confirm-by-memo",
+            None,
+            payload={"memo": memo, "amount": amount, "transactionId": transaction_id},
+        )
+
+
+@dataclass
+class CatalogMenu:
+    key: str
+    products: list[dict[str, Any]]
+    discount_percent: int
+    created_at: float
+    is_ctv: bool = False
+
+
+@dataclass
+class PendingPurchase:
+    product_id: str
+    product_name: str
+    quantity: int
+    order_id: str
+    expected_total: int
+    delivery_mode: str = "provider"
+    product_note: str = ""
+    is_ctv: bool = False
+
+
+api = WebApi(WEB_API_BASE_URL, TELEGRAM_BOT_SHARED_SECRET)
+bot: Bot | None = None
+dp = Dispatcher()
+app = FastAPI(title="Telegram account shop webhook")
+
+menus: dict[int, CatalogMenu] = {}
+purchase_attempts: dict[tuple[int, str, int, int], str] = {}
+pending_purchases: dict[int, PendingPurchase] = {}
+purchase_locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+deposit_watch_tasks: dict[tuple[int, str], asyncio.Task[Any]] = {}
+deposit_notified: set[tuple[int, str]] = set()
+admin_notified_orders: set[str] = set()
+badge_menus: dict[int, CatalogMenu] = {}
+active_ctv_users: set[int] = set()
+user_touch_cache: dict[int, tuple[float, str, str]] = {}
+profile_sync_cache: dict[int, tuple[float, str, str]] = {}
+profile_sync_tasks: dict[int, asyncio.Task[None]] = {}
+product_badge_cache: dict[str, str] | None = None
+_UNSET = object()
+
+
+# ---------------------------------------------------------------------------
+# SQLite: chỉ lưu trạng thái/menu không nhạy cảm; ví nằm ở Firebase backend
+# ---------------------------------------------------------------------------
+
+def init_db() -> None:
+    global product_badge_cache
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS telegram_users(
+                telegram_id INTEGER PRIMARY KEY,
+                first_seen_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL
+            )
+            """
+        )
+        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(telegram_users)").fetchall()}
+        if "display_name" not in columns:
+            conn.execute("ALTER TABLE telegram_users ADD COLUMN display_name TEXT NOT NULL DEFAULT ''")
+        if "username" not in columns:
+            conn.execute("ALTER TABLE telegram_users ADD COLUMN username TEXT NOT NULL DEFAULT ''")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS product_badges(
+                product_id TEXT PRIMARY KEY,
+                badge TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS provider_stock_snapshots(
+                product_id TEXT PRIMARY KEY,
+                quantity INTEGER NOT NULL,
+                product_name TEXT NOT NULL DEFAULT '',
+                duration TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bot_state(
+                state_key TEXT PRIMARY KEY,
+                state_value TEXT NOT NULL
+            )
+            """
+        )
+    product_badge_cache = None
+
+
+def load_provider_stock_snapshots() -> tuple[bool, dict[str, dict[str, Any]]]:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        rows = conn.execute(
+            "SELECT product_id, quantity, product_name, duration FROM provider_stock_snapshots"
+        ).fetchall()
+        state = conn.execute(
+            "SELECT state_value FROM bot_state WHERE state_key = 'provider_stock_initialized'"
+        ).fetchone()
+    snapshots = {
+        str(row[0]): {
+            "quantity": max(0, int(row[1] or 0)),
+            "name": str(row[2] or "Sản phẩm"),
+            "duration": str(row[3] or ""),
+        }
+        for row in rows
+    }
+    return bool(state and state[0] == "1"), snapshots
+
+
+def save_provider_stock_snapshots(snapshots: dict[str, dict[str, Any]]) -> None:
+    rows = [
+        (
+            product_id,
+            max(0, int(item.get("quantity") or 0)),
+            str(item.get("name") or "Sản phẩm")[:180],
+            str(item.get("duration") or "")[:160],
+        )
+        for product_id, item in snapshots.items()
+    ]
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        conn.execute("DELETE FROM provider_stock_snapshots")
+        if rows:
+            conn.executemany(
+                "INSERT INTO provider_stock_snapshots(product_id, quantity, product_name, duration) VALUES (?, ?, ?, ?)",
+                rows,
+            )
+        conn.execute(
+            """
+            INSERT INTO bot_state(state_key, state_value)
+            VALUES ('provider_stock_initialized', '1')
+            ON CONFLICT(state_key) DO UPDATE SET state_value = '1'
+            """
+        )
+
+
+def touch_user(telegram_id: int, display_name: str = "", username: str = "") -> None:
+    now = int(time.time())
+    clean_display_name = str(display_name or "").strip()
+    clean_username = str(username or "").strip()
+    cached = user_touch_cache.get(int(telegram_id))
+    if cached and now - cached[0] < 60 and (
+        not clean_display_name or clean_display_name == cached[1]
+    ) and (
+        not clean_username or clean_username == cached[2]
+    ):
+        return
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        conn.execute(
+            """
+            INSERT INTO telegram_users(telegram_id, first_seen_at, last_seen_at, display_name, username)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+                last_seen_at = excluded.last_seen_at,
+                display_name = CASE WHEN excluded.display_name <> '' THEN excluded.display_name ELSE telegram_users.display_name END,
+                username = CASE WHEN excluded.username <> '' THEN excluded.username ELSE telegram_users.username END
+            """,
+            (telegram_id, now, now, clean_display_name, clean_username),
+        )
+    user_touch_cache[int(telegram_id)] = (float(now), clean_display_name, clean_username)
+
+
+def backup_database() -> Path | None:
+    """Sao lưu SQLite bằng cơ chế backup native, an toàn với WAL đang hoạt động."""
+    if not DB_PATH.exists():
+        return None
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    target = BACKUP_DIR / f"telegram_shop_{timestamp}.db"
+    try:
+        with sqlite3.connect(DB_PATH, timeout=30) as source, sqlite3.connect(target, timeout=30) as destination:
+            source.backup(destination, pages=100, sleep=0.1)
+        backups = sorted(
+            BACKUP_DIR.glob("telegram_shop_*.db"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for old_backup in backups[BACKUP_KEEP:]:
+            try:
+                old_backup.unlink()
+            except OSError:
+                LOGGER.warning("Could not remove old database backup %s", old_backup)
+        LOGGER.info("Database backup created: %s", target)
+        return target
+    except (OSError, sqlite3.Error):
+        LOGGER.exception("Could not create database backup")
+        try:
+            target.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+
+
+async def database_backup_loop() -> None:
+    while True:
+        await asyncio.sleep(BACKUP_INTERVAL_SECONDS)
+        await asyncio.to_thread(backup_database)
+
+
+def backup_timezone() -> Any:
+    try:
+        return ZoneInfo(BACKUP_TIMEZONE)
+    except ZoneInfoNotFoundError:
+        if BACKUP_TIMEZONE.casefold() in {"asia/ho_chi_minh", "asia/saigon", "utc+7", "gmt+7"}:
+            return timezone(timedelta(hours=7), name="Asia/Ho_Chi_Minh")
+        LOGGER.warning("Unknown backup timezone %s; using server timezone.", BACKUP_TIMEZONE)
+        return datetime.now().astimezone().tzinfo or timezone.utc
+
+
+def seconds_until_daily_backup() -> float:
+    try:
+        hour_text, minute_text = BACKUP_DAILY_TIME.split(":", 1)
+        hour = max(0, min(23, int(hour_text)))
+        minute = max(0, min(59, int(minute_text)))
+    except (TypeError, ValueError):
+        hour, minute = 23, 0
+        LOGGER.warning("Invalid BOT_BACKUP_DAILY_TIME=%r; using 23:00.", BACKUP_DAILY_TIME)
+    now = datetime.now(backup_timezone())
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return max(1.0, (target - now).total_seconds())
+
+
+async def send_database_backup_to_admin(target_admin_id: int | None = None) -> int:
+    """Tạo bản sao mới và gửi file .db vào Telegram của admin."""
+    global bot
+    if not bot:
+        return 0
+    admin_ids = [target_admin_id] if target_admin_id else sorted(ADMIN_TELEGRAM_IDS)
+    admin_ids = [admin_id for admin_id in admin_ids if admin_id and is_admin(admin_id)]
+    if not admin_ids:
+        LOGGER.warning("No admin Telegram ID available for database backup delivery.")
+        return 0
+    backup_path = await asyncio.to_thread(backup_database)
+    if not backup_path:
+        return 0
+    caption = (
+        "💾 <b>BACKUP DỮ LIỆU BOT</b>\n\n"
+        f"📁 File: <code>{html.escape(backup_path.name)}</code>\n"
+        f"🕒 Thời gian: <b>{datetime.now(backup_timezone()).strftime('%d/%m/%Y %H:%M')}</b>\n"
+        "Hãy lưu file này ở nơi an toàn để khôi phục khi cần."
+    )
+    sent = 0
+    for admin_id in admin_ids:
+        try:
+            await bot.send_document(
+                admin_id,
+                document=FSInputFile(str(backup_path)),
+                caption=caption,
+            )
+            sent += 1
+        except Exception:
+            LOGGER.exception("Could not send database backup to admin %s", admin_id)
+    return sent
+
+
+async def daily_database_backup_loop() -> None:
+    while True:
+        await asyncio.sleep(seconds_until_daily_backup())
+        await send_database_backup_to_admin()
+
+
+def remember_user(user: Any) -> None:
+    """Lưu tên hiển thị tối thiểu để admin dễ nhận diện khách trong bot."""
+    if not user or getattr(user, "id", None) is None:
+        return
+    telegram_id = int(user.id)
+    display_name = str(getattr(user, "full_name", "") or "").strip()
+    username = str(getattr(user, "username", "") or "").strip().lstrip("@")
+    touch_user(telegram_id, display_name, username)
+
+    cached = profile_sync_cache.get(telegram_id)
+    if cached and time.monotonic() - cached[0] < 300 and cached[1:] == (display_name, username):
+        return
+    existing_task = profile_sync_tasks.get(telegram_id)
+    if existing_task and not existing_task.done():
+        return
+
+    async def sync_profile() -> None:
+        try:
+            await api.update_profile(telegram_id, display_name, username)
+            profile_sync_cache[telegram_id] = (time.monotonic(), display_name, username)
+        except ApiError as exc:
+            LOGGER.warning("Could not sync Telegram profile %s: %s", telegram_id, exc.code)
+        finally:
+            profile_sync_tasks.pop(telegram_id, None)
+
+    profile_sync_tasks[telegram_id] = asyncio.create_task(sync_profile())
+
+
+class ProfileCaptureMiddleware:
+    """Ghi nhận tên trên mọi tin nhắn và nút bấm, không chỉ lệnh /start."""
+
+    async def __call__(self, handler: Any, event: Any, data: dict[str, Any]) -> Any:
+        user = getattr(event, "from_user", None)
+        if user is None:
+            for field in ("message", "edited_message", "callback_query", "inline_query", "chosen_inline_result"):
+                update_part = getattr(event, field, None)
+                user = getattr(update_part, "from_user", None) if update_part is not None else None
+                if user is not None:
+                    break
+        if user is not None:
+            remember_user(user)
+        return await handler(event, data)
+
+
+dp.update.outer_middleware(ProfileCaptureMiddleware())
+
+
+def local_users() -> dict[int, dict[str, Any]]:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        rows = conn.execute(
+            "SELECT telegram_id, display_name, username, last_seen_at FROM telegram_users ORDER BY last_seen_at DESC"
+        ).fetchall()
+    return {
+        int(row[0]): {
+            "displayName": str(row[1] or ""),
+            "username": str(row[2] or ""),
+            "lastSeenAt": row[3],
+        }
+        for row in rows
+    }
+
+
+def merge_customer_records(customers: list[dict[str, Any]]) -> list[tuple[int, dict[str, Any]]]:
+    """Ghép số liệu Firebase với tên Telegram đã lưu tại bot, ưu tiên trường có dữ liệu."""
+    local = local_users()
+    merged: dict[int, dict[str, Any]] = {}
+    for customer in customers:
+        try:
+            user_id = int(customer.get("telegramId") or 0)
+        except (TypeError, ValueError):
+            continue
+        if user_id <= 0:
+            continue
+        local_record = local.get(user_id, {})
+        record = {**local_record, **customer}
+        record["displayName"] = (
+            str(customer.get("displayName") or "").strip()
+            or str(customer.get("name") or "").strip()
+            or str(customer.get("fullName") or "").strip()
+            or str(local_record.get("displayName") or "").strip()
+        )
+        record["username"] = (
+            str(customer.get("username") or "").strip().lstrip("@")
+            or str(local_record.get("username") or "").strip().lstrip("@")
+        )
+        merged[user_id] = record
+    for user_id, record in local.items():
+        merged.setdefault(user_id, record)
+    return sorted(
+        merged.items(),
+        key=lambda item: timestamp_value(item[1].get("lastSeenAt")),
+        reverse=True,
+    )
+
+
+def customer_detail_text(rows: list[tuple[int, dict[str, Any]]], start_index: int = 1) -> str:
+    cards: list[str] = []
+    for index, (user_id, record) in enumerate(rows, start=start_index):
+        name = " ".join(str(record.get("displayName") or "").split()) or f"Khách {user_id}"
+        username = str(record.get("username") or "").strip().lstrip("@")
+        if username.casefold() == f"tg_{user_id}".casefold():
+            username = ""
+        username_text = f"@{html.escape(username)}" if username else "Chưa đặt username"
+        order_count = int(float(record.get("orders") or 0))
+        cards.append(
+            f"<b>{index}. <a href=\"tg://user?id={user_id}\">{html.escape(name)}</a></b>\n"
+            f"👤 Username: {username_text}\n"
+            f"🆔 UID: <code>{user_id}</code>\n"
+            f"🧾 Số đơn: <b>{order_count}</b> · 💰 Số dư: <b>{money(record.get('balance'))}</b>\n"
+            f"💸 Đã chi tiêu: <b>{money(record.get('spent'))}</b>\n"
+            f"🕒 Hoạt động gần nhất: <b>{html.escape(vi_time(record.get('lastSeenAt')))}</b>"
+        )
+    return "\n\n".join(cards)
+
+
+def admin_users_pagination_keyboard(page: int, page_count: int) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    navigation: list[InlineKeyboardButton] = []
+    if page > 1:
+        navigation.append(InlineKeyboardButton(text="‹ Trang trước", callback_data=f"admin_users|{page - 1}"))
+    if page < page_count:
+        navigation.append(InlineKeyboardButton(text="Trang sau ›", callback_data=f"admin_users|{page + 1}"))
+    if navigation:
+        rows.append(navigation)
+    rows.append([
+        InlineKeyboardButton(text="🔄 Làm mới", callback_data=f"admin_users|{page}"),
+        InlineKeyboardButton(text="🛠 Quản trị", callback_data="admin_dashboard"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def product_key(product: dict[str, Any]) -> str:
+    return str(product.get("id") or product.get("productId") or product.get("name") or "").strip()
+
+
+def product_name_group_key(value: Any) -> str:
+    normalized_name = " ".join(str(value or "").split()).casefold()
+    if not normalized_name:
+        return ""
+    digest = hashlib.sha256(normalized_name.encode("utf-8")).hexdigest()
+    return f"_name_{digest}"
+
+
+def normalize_product_badge(value: str) -> str:
+    badge = " ".join(str(value or "").split()).strip()
+    return badge[:12]
+
+
+def sticker_badge_data(value: str) -> dict[str, str] | None:
+    try:
+        payload = json.loads(str(value or ""))
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get("type") != "telegram_sticker":
+        return None
+    file_id = str(payload.get("file_id") or "").strip()
+    if not file_id:
+        return None
+    return {
+        "file_id": file_id,
+        "emoji": normalize_product_badge(str(payload.get("emoji") or "🏷️")) or "🏷️",
+    }
+
+
+def custom_emoji_badge_data(value: str) -> dict[str, str] | None:
+    try:
+        payload = json.loads(str(value or ""))
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get("type") != "telegram_custom_emoji":
+        return None
+    custom_emoji_id = str(payload.get("custom_emoji_id") or "").strip()
+    if not custom_emoji_id:
+        return None
+    return {
+        "custom_emoji_id": custom_emoji_id,
+        "emoji": normalize_product_badge(str(payload.get("emoji") or "🏷️")) or "🏷️",
+    }
+
+
+def product_badge_value(product: dict[str, Any]) -> str:
+    global product_badge_cache
+    key = product_key(product)
+    group_key = product_name_group_key(product.get("name"))
+    if key or group_key:
+        if product_badge_cache is None:
+            try:
+                with sqlite3.connect(DB_PATH, timeout=30) as conn:
+                    rows = conn.execute("SELECT product_id, badge FROM product_badges").fetchall()
+                product_badge_cache = {
+                    str(row[0]).strip(): str(row[1]).strip()
+                    for row in rows
+                    if str(row[0] or "").strip() and str(row[1] or "").strip()
+                }
+            except sqlite3.Error:
+                LOGGER.debug("Product badge table is not ready yet")
+                product_badge_cache = {}
+        # A group badge wins so an admin can override all same-name products at once.
+        for badge_key in (group_key, key):
+            custom_badge = product_badge_cache.get(badge_key)
+            if custom_badge:
+                return custom_badge
+    return ""
+
+
+def product_badge(product: dict[str, Any]) -> str:
+    custom_badge = product_badge_value(product)
+    visual = sticker_badge_data(custom_badge) or custom_emoji_badge_data(custom_badge)
+    if visual:
+        return visual["emoji"]
+    if custom_badge:
+        return normalize_product_badge(custom_badge) or "📦"
+    fallback = normalize_product_badge(str(product.get("badge") or product.get("icon") or product.get("emoji") or ""))
+    return fallback or "📦"
+
+
+def product_sticker_file_id(product: dict[str, Any]) -> str:
+    sticker = sticker_badge_data(product_badge_value(product))
+    return sticker["file_id"] if sticker else ""
+
+
+def product_custom_emoji_id(product: dict[str, Any]) -> str:
+    custom_emoji = custom_emoji_badge_data(product_badge_value(product))
+    return custom_emoji["custom_emoji_id"] if custom_emoji else ""
+
+
+def product_badge_html(product: dict[str, Any]) -> str:
+    custom_emoji_id = product_custom_emoji_id(product)
+    fallback = html.escape(product_badge(product))
+    if custom_emoji_id:
+        return f'<tg-emoji emoji-id="{html.escape(custom_emoji_id, quote=True)}">{fallback}</tg-emoji>'
+    return fallback
+
+
+def stored_product_badge(badge: str | None) -> str:
+    sticker = sticker_badge_data(badge or "")
+    custom_emoji = custom_emoji_badge_data(badge or "")
+    if sticker:
+        return json.dumps({"type": "telegram_sticker", **sticker}, ensure_ascii=False)
+    if custom_emoji:
+        return json.dumps({"type": "telegram_custom_emoji", **custom_emoji}, ensure_ascii=False)
+    return normalize_product_badge(badge or "")
+
+
+def save_product_badge(product_id: str, badge: str | None) -> None:
+    global product_badge_cache
+    key = str(product_id or "").strip()
+    if not key:
+        return
+    stored_badge = stored_product_badge(badge)
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        if stored_badge:
+            conn.execute(
+                """
+                INSERT INTO product_badges(product_id, badge, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(product_id) DO UPDATE SET badge = excluded.badge, updated_at = excluded.updated_at
+                """,
+                (key, stored_badge, int(time.time())),
+            )
+        else:
+            conn.execute("DELETE FROM product_badges WHERE product_id = ?", (key,))
+    if product_badge_cache is not None:
+        if stored_badge:
+            product_badge_cache[key] = stored_badge
+        else:
+            product_badge_cache.pop(key, None)
+
+
+def replace_local_product_badges(badges: dict[str, str]) -> None:
+    global product_badge_cache
+    normalized = {
+        str(product_id).strip(): str(badge).strip()
+        for product_id, badge in badges.items()
+        if str(product_id).strip() and str(badge).strip()
+    }
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        conn.execute("DELETE FROM product_badges")
+        conn.executemany(
+            "INSERT INTO product_badges(product_id, badge, updated_at) VALUES (?, ?, ?)",
+            [(product_id, badge, int(time.time())) for product_id, badge in normalized.items()],
+        )
+    product_badge_cache = normalized
+
+
+async def sync_product_badges_from_api() -> None:
+    if not ADMIN_TELEGRAM_ID:
+        return
+    try:
+        remote_badges = await api.product_badges(ADMIN_TELEGRAM_ID)
+    except ApiError as exc:
+        LOGGER.warning("Could not load persistent product badges: %s", exc.code)
+        return
+    try:
+        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+            local_rows = conn.execute("SELECT product_id, badge FROM product_badges").fetchall()
+        local_badges = {str(key): str(value) for key, value in local_rows if str(value or "").strip()}
+        for product_id, badge in local_badges.items():
+            if product_id not in remote_badges:
+                try:
+                    await api.save_product_badge(ADMIN_TELEGRAM_ID, product_id, badge)
+                    remote_badges[product_id] = badge
+                except ApiError as exc:
+                    LOGGER.warning("Could not migrate local badge for %s: %s", product_id, exc.code)
+                    remote_badges[product_id] = badge
+        replace_local_product_badges({**local_badges, **remote_badges})
+        LOGGER.info("Loaded %s persistent product badges", len(remote_badges))
+    except sqlite3.Error:
+        LOGGER.exception("Could not refresh local product badge cache")
+
+
+# ---------------------------------------------------------------------------
+# UI helpers
+# ---------------------------------------------------------------------------
+
+UI_DIVIDER = "━━━━━━━━━━━━━━"
+
+def money(value: Any) -> str:
+    try:
+        amount = int(round(float(value or 0)))
+    except (TypeError, ValueError):
+        amount = 0
+    return f"{amount:,}".replace(",", ".") + "đ"
+
+
+def deposit_requirement_text() -> str:
+    if MIN_DEPOSIT <= 0:
+        return "không giới hạn tối thiểu, số tiền phải lớn hơn 0"
+    return f"tối thiểu <b>{money(MIN_DEPOSIT)}</b>"
+
+
+def new_order_id() -> str:
+    """Tạo mã đơn ngắn, không làm lộ Telegram ID của khách."""
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "DH-" + "".join(secrets.choice(alphabet) for _ in range(8))
+
+
+def support_url() -> str:
+    return f"https://t.me/{SUPPORT_HANDLE.lstrip('@')}"
+
+
+def order_support_url(order_id: str) -> str:
+    message = f"Chào admin, tôi cần hỗ trợ đơn hàng {order_id}."
+    return f"{support_url()}?text={quote(message)}"
+
+
+def support_link() -> str:
+    """Liên kết mở thẳng cuộc trò chuyện hỗ trợ, không dùng dạng mã sao chép."""
+    return (
+        f'<a href="{html.escape(support_url(), quote=True)}">'
+        f"{html.escape(SUPPORT_HANDLE)}"
+        "</a>"
+    )
+
+
+def support_line() -> str:
+    return f"🆘 Hỗ trợ: {support_link()}"
+
+
+def order_status_icon(status: Any) -> str:
+    normalized = str(status or "").strip().lower()
+    if any(value in normalized for value in ("hoàn thành", "thành công", "completed", "success")):
+        return "✅"
+    if any(value in normalized for value in ("hủy", "huỷ", "lỗi", "failed", "cancel")):
+        return "❌"
+    return "⏳"
+
+
+def short_text(value: Any, length: int = 30) -> str:
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= length else text[: max(1, length - 1)] + "…"
+
+
+def product_warranty(product: dict[str, Any]) -> str:
+    """Chuẩn hóa bảo hành theo cùng cách hiển thị của website."""
+    if not product:
+        return "Không bảo hành"
+
+    raw_warranty = str(product.get("warranty") or "").strip()
+    normalized = raw_warranty.casefold()
+    if raw_warranty and normalized not in {"không bảo hành", "khong bao hanh", "none", "no", "-"}:
+        if re.match(r"^bảo hành\b", raw_warranty, re.IGNORECASE):
+            return raw_warranty
+        return f"Bảo hành {raw_warranty}"
+
+    try:
+        warranty_days = float(product.get("warrantyDays") or 0)
+    except (TypeError, ValueError):
+        warranty_days = 0
+    if warranty_days > 0:
+        days = int(warranty_days) if warranty_days.is_integer() else warranty_days
+        return f"Bảo hành {days:g} ngày"
+
+    desc = str(product.get("desc") or "")
+    match = re.search(r"bảo hành\s*[:\-]?\s*([^.,;\n]+)", desc, re.IGNORECASE)
+    if match:
+        value = match.group(0).strip()
+        return value if re.match(r"^bảo hành\b", value, re.IGNORECASE) else f"Bảo hành {value}"
+    return "Không bảo hành"
+
+
+def vi_time(timestamp: Any) -> str:
+    try:
+        from datetime import datetime, timedelta
+
+        value = timestamp_value(timestamp)
+        if value <= 0:
+            return "Không rõ thời gian"
+        dt = datetime.utcfromtimestamp(value / 1000) + timedelta(hours=7)
+        return dt.strftime("%d/%m/%Y %H:%M")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "Không rõ thời gian"
+
+
+def timestamp_value(timestamp: Any) -> float:
+    try:
+        value = float(timestamp or 0)
+        # SQLite stores seconds while Firebase timestamps are milliseconds.
+        return value * 1000 if 0 < value < 100_000_000_000 else value
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def is_admin(telegram_id: int | str) -> bool:
+    try:
+        return int(telegram_id) in ADMIN_TELEGRAM_IDS
+    except (TypeError, ValueError):
+        return False
+
+
+def main_keyboard(telegram_id: int | None = None) -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton(text="📦 Sản phẩm"), KeyboardButton(text="💰 Số dư")],
+        [KeyboardButton(text="💳 Nạp tiền"), KeyboardButton(text="🧾 Đơn hàng")],
+        [KeyboardButton(text="ℹ️ Trợ giúp"), KeyboardButton(text="🆘 Hỗ trợ")],
+    ]
+    if telegram_id is not None and is_admin(telegram_id):
+        rows.append([KeyboardButton(text="🛠 Quản trị")])
+    if telegram_id is not None and int(telegram_id) in active_ctv_users:
+        rows.append([KeyboardButton(text="🏪 Kênh CTV")])
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
+        resize_keyboard=True,
+        input_field_placeholder="Chọn chức năng…",
+    )
+
+
+def back_to_products_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📦 Xem sản phẩm", callback_data="products")],
+            [InlineKeyboardButton(text="🏠 Trang chủ", callback_data="home")],
+        ]
+    )
+
+
+def home_inline_keyboard(telegram_id: int | None = None) -> InlineKeyboardMarkup:
+    rows = [
+            [InlineKeyboardButton(text="📦 Xem sản phẩm", callback_data="products")],
+            [
+                InlineKeyboardButton(text="💳 Nạp tiền", callback_data="deposit"),
+                InlineKeyboardButton(text="💰 Số dư", callback_data="balance"),
+            ],
+            [
+                InlineKeyboardButton(text="🧾 Đơn hàng", callback_data="orders"),
+                InlineKeyboardButton(text="ℹ️ Hướng dẫn", callback_data="help"),
+            ],
+            [InlineKeyboardButton(text="🆘 Liên hệ hỗ trợ", url=support_url())],
+    ]
+    if telegram_id is not None and telegram_id in active_ctv_users:
+        rows.insert(1, [InlineKeyboardButton(text="🏪 Kênh CTV", callback_data="ctv_open")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def utility_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="📦 Sản phẩm", callback_data="products"),
+                InlineKeyboardButton(text="💳 Nạp tiền", callback_data="deposit"),
+            ],
+            [
+                InlineKeyboardButton(text="🧾 Đơn hàng", callback_data="orders"),
+                InlineKeyboardButton(text="🏠 Trang chủ", callback_data="home"),
+            ],
+        ]
+    )
+
+
+def after_purchase_keyboard(is_ctv: bool = False) -> InlineKeyboardMarkup:
+    products_label = "🏪 Mua tiếp với giá CTV" if is_ctv else "📦 Mua tiếp"
+    products_action = "ctv_open" if is_ctv else "products"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text=products_label, callback_data=products_action),
+                InlineKeyboardButton(text="💰 Số dư", callback_data="balance"),
+            ],
+            [
+                InlineKeyboardButton(text="🧾 Đơn hàng", callback_data="orders"),
+                InlineKeyboardButton(text="🏠 Trang chủ", callback_data="home"),
+            ],
+            [InlineKeyboardButton(text="🆘 Hỗ trợ", url=support_url())],
+        ]
+    )
+
+
+def manual_order_keyboard(order_id: str, is_ctv: bool = False) -> InlineKeyboardMarkup:
+    products_label = "🏪 Kênh CTV" if is_ctv else "📦 Sản phẩm"
+    products_action = "ctv_open" if is_ctv else "products"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💬 Inbox admin, gửi mã đơn", url=order_support_url(order_id))],
+            [
+                InlineKeyboardButton(text=products_label, callback_data=products_action),
+                InlineKeyboardButton(text="🧾 Đơn hàng", callback_data="orders"),
+            ],
+            [InlineKeyboardButton(text="🏠 Trang chủ", callback_data="home")],
+        ]
+    )
+
+
+def menu_for_user(user_id: int) -> CatalogMenu | None:
+    menu = menus.get(user_id)
+    if not menu or time.time() - menu.created_at > 30 * 60:
+        return None
+    return menu
+
+
+def catalog_keyboard(menu: CatalogMenu, page: int) -> InlineKeyboardMarkup:
+    total_pages = max(1, (len(menu.products) + CATALOG_PAGE_SIZE - 1) // CATALOG_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * CATALOG_PAGE_SIZE
+    rows: list[list[InlineKeyboardButton]] = []
+    for index, product in enumerate(menu.products[start : start + CATALOG_PAGE_SIZE], start=start):
+        stock = int(product.get("quantity") or 0)
+        stock_text = f"🟢 {stock}" if stock > 0 else "🔴 hết"
+        duration = short_text(product.get("duration") or "Dùng ngay", 14)
+        custom_emoji_id = product_custom_emoji_id(product)
+        badge_prefix = "" if custom_emoji_id else f"{product_badge(product)} "
+        label = (
+            f"{badge_prefix}{short_text(product.get('name'), 15)} · "
+            f"⏳ {duration} · {money(product.get('finalPrice', product.get('price')))} · {stock_text}"
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=label,
+                    callback_data=f"product|{menu.key}|{index}",
+                    icon_custom_emoji_id=custom_emoji_id or None,
+                )
+            ]
+        )
+
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="‹ Trước", callback_data=f"catalog|{menu.key}|{page - 1}"))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton(text="Sau ›", callback_data=f"catalog|{menu.key}|{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append(
+        [
+            InlineKeyboardButton(text="🔄 Làm mới", callback_data="products"),
+            InlineKeyboardButton(text="🏠 Trang chủ", callback_data="home"),
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def product_text(product: dict[str, Any], discount_percent: int, *, ctv_mode: bool = False) -> str:
+    name = html.escape(str(product.get("name") or "Sản phẩm"))
+    desc = html.escape(str(product.get("desc") or "").strip())
+    duration = html.escape(str(product.get("duration") or "Dùng ngay"))
+    fmt = html.escape(str(product.get("format") or "Theo mô tả sản phẩm"))
+    warranty = html.escape(product_warranty(product))
+    badge = product_badge_html(product)
+    stock = int(product.get("quantity") or 0)
+    price = money(product.get("finalPrice", product.get("price")))
+    old_price = money(product.get("price"))
+    price_line = f"💵 Giá CTV: <b>{price}</b>" if ctv_mode else f"💵 Giá: <b>{price}</b>"
+    if not ctv_mode and discount_percent > 0 and int(product.get("finalPrice") or 0) != int(product.get("price") or 0):
+        price_line += f" <s>{old_price}</s> (-{discount_percent}%)"
+    lines = [
+        f"{badge} <b>{name}</b>",
+        UI_DIVIDER,
+        "",
+        price_line,
+        f"📦 Tình trạng: <b>{stock} tài khoản</b>" if stock > 0 else "📦 Tình trạng: <b>Hết hàng</b>",
+        f"⏳ Thời hạn: {duration}",
+        f"🧾 Định dạng: <code>{fmt}</code>",
+        f"🛡 Bảo hành: {warranty}",
+    ]
+    if str(product.get("deliveryMode") or "") == "manual":
+        lines.append("🧑‍💼 Giao hàng: Admin xác nhận sau khi đặt")
+    if desc:
+        lines.extend(["", desc])
+    return "\n".join(lines)
+
+
+def product_image_url(product: dict[str, Any]) -> str:
+    """Lấy URL ảnh công khai của sản phẩm để Telegram tải ảnh trực tiếp.
+
+    Telegram nhận URL qua URLInputFile nên URL không bị đưa vào nội dung tin nhắn.
+    Hỗ trợ cả logoUrl do backend trả về và logoUrls/imageUrl để tương thích dữ liệu cũ.
+    """
+    candidates: list[Any] = [product.get("logoUrl"), product.get("imageUrl")]
+    logo_urls = product.get("logoUrls")
+    if isinstance(logo_urls, (list, tuple)):
+        candidates.extend(logo_urls)
+
+    for candidate in candidates:
+        value = str(candidate or "").strip()
+        if not value:
+            continue
+        if re.match(r"^https?://", value, re.IGNORECASE):
+            return value
+        # Cho phép dữ liệu cũ lưu đường dẫn tương đối, ví dụ /assets/logo.png.
+        if value.startswith("/") and WEB_API_BASE_URL:
+            site_origin = WEB_API_BASE_URL
+            if site_origin.lower().endswith("/api"):
+                site_origin = site_origin[:-4]
+            return urljoin(site_origin.rstrip("/") + "/", value.lstrip("/"))
+    return ""
+
+
+def product_photo_caption(product: dict[str, Any], discount_percent: int, *, ctv_mode: bool = False) -> str:
+    """Caption ngắn gọn, luôn nằm trong giới hạn caption ảnh của Telegram."""
+    caption = product_text(product, discount_percent, ctv_mode=ctv_mode)
+    if len(caption) <= 1024:
+        return caption
+    name = html.escape(str(product.get("name") or "Sản phẩm"))
+    stock = int(product.get("quantity") or 0)
+    price = money(product.get("finalPrice", product.get("price")))
+    duration = html.escape(str(product.get("duration") or "Dùng ngay"))
+    return (
+        f"<b>{name}</b>\n{UI_DIVIDER}\n"
+        f"💵 {'Giá CTV' if ctv_mode else 'Giá'}: <b>{price}</b>\n"
+        f"📦 Tình trạng: <b>{stock} tài khoản</b>\n"
+        f"⏳ Thời hạn: {duration}"
+    )
+
+
+def product_detail_keyboard(menu: CatalogMenu, index: int, product: dict[str, Any]) -> InlineKeyboardMarkup:
+    stock = int(product.get("quantity") or 0)
+    rows: list[list[InlineKeyboardButton]] = []
+    if stock > 0:
+        rows.append(
+            [
+                InlineKeyboardButton(text="🛒 Mua ngay", callback_data=f"payment|{menu.key}|{index}|1"),
+                InlineKeyboardButton(text="🔢 Số lượng", callback_data=f"quantity|{menu.key}|{index}"),
+            ]
+        )
+    else:
+        rows.append([InlineKeyboardButton(text="⚠️ Hết hàng", callback_data=f"catalog|{menu.key}|{index // CATALOG_PAGE_SIZE}")])
+    rows.append(
+        [
+            InlineKeyboardButton(text="💳 Nạp tiền", callback_data="deposit"),
+            InlineKeyboardButton(text="🏠 Trang chủ", callback_data="home"),
+        ]
+    )
+    rows.append([InlineKeyboardButton(text="‹ Quay lại danh sách", callback_data=f"catalog|{menu.key}|{index // CATALOG_PAGE_SIZE}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def payment_method_keyboard(menu: CatalogMenu, index: int, quantity: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💰 Thanh toán bằng số dư", callback_data=f"pay_balance|{menu.key}|{index}|{quantity}")],
+            [InlineKeyboardButton(text="📲 Thanh toán QR nhanh", callback_data=f"pay_qr|{menu.key}|{index}|{quantity}")],
+            [InlineKeyboardButton(text="‹ Quay lại sản phẩm", callback_data=f"product|{menu.key}|{index}")],
+        ]
+    )
+
+
+async def answer_in_chunks(message: Message, text: str, reply_markup: Any = None) -> None:
+    chunks = split_text_lines(text)
+    for index, chunk in enumerate(chunks):
+        await message.answer(chunk, reply_markup=reply_markup if index == len(chunks) - 1 else None)
+
+
+def split_text_lines(text: str, max_length: int = 3900) -> list[str]:
+    """Chia văn bản theo dòng để không cắt giữa thẻ HTML của Telegram."""
+    chunks: list[str] = []
+    current = ""
+    for line in text.splitlines(keepends=True):
+        if current and len(current) + len(line) > max_length:
+            chunks.append(current.rstrip("\n"))
+            current = ""
+        if len(line) > max_length:
+            for start in range(0, len(line), max_length):
+                part = line[start : start + max_length]
+                if current:
+                    chunks.append(current.rstrip("\n"))
+                    current = ""
+                chunks.append(part.rstrip("\n"))
+        else:
+            current += line
+    if current:
+        chunks.append(current.rstrip("\n"))
+    return chunks or [""]
+
+
+async def handle_api_error(target: Message | CallbackQuery, exc: ApiError) -> None:
+    message = f"⚠️ {html.escape(public_error_message(exc))}"
+    if isinstance(target, CallbackQuery):
+        if target.message:
+            await target.message.answer(message)
+        await target.answer("Có lỗi, vui lòng thử lại.")
+    else:
+        await target.answer(message)
+
+
+async def notify_admin(text: str) -> None:
+    global bot
+    if not bot or not ADMIN_TELEGRAM_IDS:
+        return
+    async def send_one(admin_id: int) -> None:
+        try:
+            await bot.send_message(admin_id, text)
+        except Exception:
+            LOGGER.exception("Could not notify admin %s", admin_id)
+
+    await asyncio.gather(*(send_one(admin_id) for admin_id in sorted(ADMIN_TELEGRAM_IDS)))
+
+
+def public_error_message(exc: ApiError) -> str:
+    """Ẩn chi tiết kỹ thuật nội bộ khỏi tin nhắn gửi cho khách."""
+    if exc.code.startswith("PROVIDER_") or exc.code in {
+        "PRODUCT_NOT_PROVIDER",
+        "PROVIDER_DISABLED",
+    }:
+        return "Sản phẩm tạm thời chưa thể xử lý. Vui lòng thử lại sau hoặc liên hệ hỗ trợ.\n\n" + support_line()
+    return exc.message
+
+
+def admin_error_message(exc: ApiError) -> str:
+    """Thông báo nội bộ đã rút gọn, không đẩy giá vốn/phản hồi thô lên Telegram."""
+    if exc.code == "PROVIDER_PURCHASE_UNCERTAIN":
+        return "Hệ thống nhận phản hồi không rõ từ bên giao hàng; đơn cần được kiểm tra thủ công."
+    if exc.code.startswith("PROVIDER_"):
+        return "Đơn không thể hoàn tất tự động; tiền đã được hoàn về số dư khách."
+    return "Yêu cầu thất bại; vui lòng kiểm tra log hệ thống để biết chi tiết."
+
+
+def admin_error_code(exc: ApiError) -> str:
+    if exc.code == "PROVIDER_PURCHASE_UNCERTAIN":
+        return "ORDER_REVIEW"
+    if exc.code.startswith("PROVIDER_"):
+        return "DELIVERY_FAILED"
+    return "SYSTEM_ERROR"
+
+
+async def notify_admin_order_with_accounts(
+    telegram_id: int,
+    order_id: str,
+    product_name: str,
+    quantity: int,
+    total: Any,
+    delivery_text: str,
+    is_ctv: bool = False,
+) -> None:
+    """Gửi thông tin đơn và toàn bộ tài khoản đã cấp cho admin."""
+    await notify_admin(
+        "🛒 <b>ĐƠN HÀNG HOÀN TẤT</b>\n\n"
+        f"👤 Telegram ID: <code>{telegram_id}</code>\n"
+        f"🤝 Kênh: <b>{'CTV' if is_ctv else 'Khách lẻ'}</b>\n"
+        f"🧾 Mã đơn: <code>{html.escape(order_id)}</code>\n"
+        f"📦 Sản phẩm: <b>{html.escape(product_name or 'Sản phẩm')}</b>\n"
+        f"🔢 Số lượng: <b>{quantity}</b>\n"
+        f"💵 Thanh toán: <b>{money(total)}</b>"
+    )
+    escaped = html.escape(delivery_text[:12000])
+    for chunk_start in range(0, len(escaped), 3700):
+        await notify_admin(f"🔐 <b>THÔNG TIN ĐÃ CẤP</b>\n<pre>{escaped[chunk_start : chunk_start + 3700]}</pre>")
+
+
+async def notify_admin_manual_order(
+    telegram_id: int,
+    order_id: str,
+    product_name: str,
+    quantity: int,
+    total: Any,
+    note: str,
+    is_ctv: bool = False,
+) -> None:
+    note_text = html.escape(note.strip()) if note.strip() else "Không có ghi chú."
+    await notify_admin(
+        "🛒 <b>ĐƠN HÀNG THỦ CÔNG MỚI</b>\n\n"
+        f"👤 Telegram ID: <code>{telegram_id}</code>\n"
+        f"🤝 Kênh: <b>{'CTV' if is_ctv else 'Khách lẻ'}</b>\n"
+        f"🧾 Mã đơn: <code>{html.escape(order_id)}</code>\n"
+        f"📦 Sản phẩm: <b>{html.escape(product_name or 'Sản phẩm')}</b>\n"
+        f"🔢 Số lượng: <b>{quantity}</b>\n"
+        f"💵 Thanh toán: <b>{money(total)}</b>\n"
+        f"📝 Ghi chú: {note_text}\n\n"
+        "⏳ Đơn đang chờ admin xử lý."
+    )
+
+
+async def fetch_order_detail(telegram_id: int, order_id: str) -> dict[str, Any]:
+    detail: dict[str, Any] | None = None
+    for attempt in range(4):
+        try:
+            detail = await api.order_detail(telegram_id, order_id)
+            if (
+                detail.get("status") == "Hoàn thành"
+                or detail.get("deliveredAccounts")
+                or str(detail.get("deliveryMode") or "") == "manual"
+            ):
+                break
+        except ApiError:
+            if attempt == 3:
+                raise
+            await asyncio.sleep(0.35)
+    return detail or {}
+
+
+async def edit_message_content(
+    message: Message,
+    text: str,
+    reply_markup: Any = None,
+) -> Message | None:
+    """Edit either a text message or a product-photo message."""
+    if getattr(message, "photo", None):
+        try:
+            return await message.edit_caption(caption=text, reply_markup=reply_markup)
+        except Exception:
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            return await message.answer(text, reply_markup=reply_markup)
+    return await message.edit_text(text, reply_markup=reply_markup)
+
+
+async def send_purchase_result(
+    telegram_id: int,
+    result: dict[str, Any],
+    detail: dict[str, Any],
+    fallback_product_name: str,
+    expected_total: int,
+    order_id: str,
+    initial_message: Message | None = None,
+    is_ctv: bool = False,
+) -> bool:
+    """Gửi kết quả mua hàng, trả về True khi đã có dữ liệu tài khoản."""
+    global bot
+    status = str(detail.get("status") or result.get("status") or "Đang xử lý")
+    delivery_mode = str(detail.get("deliveryMode") or result.get("deliveryMode") or "")
+    fulfillment_source = str(detail.get("fulfillmentSource") or result.get("fulfillmentSource") or "")
+    if delivery_mode == "manual" or fulfillment_source == "manual":
+        product_name = str(detail.get("productName") or result.get("productName") or fallback_product_name or "Sản phẩm")
+        product_note = str(detail.get("productNote") or result.get("productNote") or "").strip()
+        total = detail.get("price") or result.get("totalAmount") or expected_total
+        note_text = html.escape(product_note) if product_note else "Không có ghi chú."
+        text = (
+            "✅ <b>ĐẶT HÀNG THÀNH CÔNG</b>\n"
+            f"{UI_DIVIDER}\n"
+            f"🧾 Mã đơn: <code>{html.escape(order_id)}</code>\n"
+            f"📦 Sản phẩm: <b>{html.escape(product_name)}</b>\n"
+            f"🔢 Số lượng: <b>{int(detail.get('quantity') or result.get('quantity') or 1)}</b>\n"
+            f"💵 Giá: <b>{money(total)}</b>\n"
+            f"📝 Ghi chú: {note_text}\n\n"
+            "⏳ Đơn đang chờ admin xử lý. Vui lòng inbox admin và gửi mã đơn phía trên để nhận hàng."
+        )
+        markup = manual_order_keyboard(order_id, is_ctv=is_ctv)
+        if initial_message:
+            await edit_message_content(initial_message, text, reply_markup=markup)
+        elif bot:
+            await bot.send_message(telegram_id, text, reply_markup=markup)
+        if order_id not in admin_notified_orders and not result.get("idempotent"):
+            admin_notified_orders.add(order_id)
+            await notify_admin_manual_order(
+                telegram_id,
+                order_id,
+                product_name,
+                int(detail.get("quantity") or result.get("quantity") or 1),
+                total,
+                product_note,
+                is_ctv=is_ctv,
+            )
+        return True
+
+    accounts = detail.get("deliveredAccounts")
+    if not isinstance(accounts, list):
+        accounts = []
+    account_details = str(detail.get("accountDetails") or "").strip()
+    has_delivery = bool(accounts) or (status == "Hoàn thành" and bool(account_details))
+    if not has_delivery:
+        text = (
+            "🧾 <b>ĐƠN ĐÃ GHI NHẬN</b>\n\n"
+            f"Mã đơn: <code>{html.escape(order_id)}</code>\n"
+            f"Trạng thái: <b>{html.escape(status)}</b>\n\n"
+            "Hệ thống chưa trả thông tin tài khoản ngay lúc này. Vui lòng xem lại trong mục Đơn hàng.\n\n"
+            f"{support_line()}"
+        )
+        if initial_message:
+            await edit_message_content(initial_message, text, reply_markup=after_purchase_keyboard(is_ctv))
+        elif bot:
+            await bot.send_message(telegram_id, text, reply_markup=after_purchase_keyboard(is_ctv))
+        return False
+
+    if accounts:
+        delivery_text = "\n".join(f"[{i}] {str(value)}" for i, value in enumerate(accounts, start=1))
+    else:
+        delivery_text = account_details
+    delivery_text = delivery_text[:12000]
+    escaped_delivery_text = html.escape(delivery_text)
+    summary = (
+        "✅ <b>MUA TÀI KHOẢN THÀNH CÔNG</b>\n\n"
+        f"🧾 Mã đơn: <code>{html.escape(order_id)}</code>\n"
+        f"📦 Sản phẩm: <b>{html.escape(str(detail.get('productName') or fallback_product_name or 'Sản phẩm'))}</b>\n"
+        f"🔢 Số lượng: <b>{int(detail.get('deliveredQuantity') or len(accounts))}</b>\n"
+        f"💵 Thanh toán: <b>{money(detail.get('price') or result.get('totalAmount') or expected_total)}</b>\n\n"
+        "🔐 <b>THÔNG TIN TÀI KHOẢN</b>\n"
+        f"{support_line()}"
+    )
+    if initial_message:
+        await edit_message_content(initial_message, summary, reply_markup=after_purchase_keyboard(is_ctv))
+        target = initial_message
+        for chunk_start in range(0, len(escaped_delivery_text), 3800):
+            await target.answer(f"<pre>{escaped_delivery_text[chunk_start : chunk_start + 3800]}</pre>")
+    elif bot:
+        await bot.send_message(telegram_id, summary, reply_markup=after_purchase_keyboard(is_ctv))
+        for chunk_start in range(0, len(escaped_delivery_text), 3800):
+            await bot.send_message(telegram_id, f"<pre>{escaped_delivery_text[chunk_start : chunk_start + 3800]}</pre>")
+    if order_id not in admin_notified_orders:
+        admin_notified_orders.add(order_id)
+        await notify_admin_order_with_accounts(
+            telegram_id,
+            order_id,
+            str(detail.get('productName') or fallback_product_name or 'Sản phẩm'),
+            int(detail.get('deliveredQuantity') or len(accounts)),
+            detail.get('price') or result.get('totalAmount') or expected_total,
+            delivery_text,
+            is_ctv=is_ctv,
+        )
+    return True
+
+
+async def resume_pending_purchase(telegram_id: int, pending: PendingPurchase) -> None:
+    global bot
+    try:
+        if bot:
+            await bot.send_message(
+                telegram_id,
+                f"⏳ Đã đủ số dư. Bot đang tự động xử lý <b>{html.escape(pending.product_name)}</b>…",
+            )
+        if pending.delivery_mode == "manual":
+            result = await api.manual_checkout(telegram_id, pending.product_id, pending.order_id, pending.quantity, ctv_mode=pending.is_ctv)
+            detail = result
+        else:
+            result = await api.checkout(telegram_id, pending.product_id, pending.order_id, pending.quantity, ctv_mode=pending.is_ctv)
+            api.invalidate_balance(telegram_id)
+            api.invalidate_catalog()
+            detail = await fetch_order_detail(telegram_id, pending.order_id)
+        api.invalidate_balance(telegram_id)
+        api.invalidate_catalog()
+        await send_purchase_result(
+            telegram_id,
+            result,
+            detail,
+            pending.product_name,
+            pending.expected_total,
+            pending.order_id,
+            is_ctv=pending.is_ctv,
+        )
+    except ApiError as exc:
+        LOGGER.warning(
+            "Checkout failed for order %s (%s): %s",
+            pending.order_id,
+            exc.code,
+            exc.message,
+        )
+        await notify_admin(
+            "⚠️ <b>ĐƠN HÀNG CẦN KIỂM TRA</b>\n\n"
+            f"👤 Telegram ID: <code>{telegram_id}</code>\n"
+            f"🧾 Mã đơn: <code>{html.escape(pending.order_id)}</code>\n"
+            f"📌 Mã xử lý: <code>{admin_error_code(exc)}</code>\n"
+            f"{html.escape(admin_error_message(exc))}"
+        )
+        if bot:
+            if exc.code == "PROVIDER_PURCHASE_UNCERTAIN":
+                await bot.send_message(
+                    telegram_id,
+                    f"⚠️ Đơn <code>{html.escape(pending.order_id)}</code> cần admin kiểm tra. Hệ thống đã khóa mua lại để tránh trừ tiền hai lần.",
+                )
+            else:
+                await bot.send_message(telegram_id, f"❌ Không thể hoàn tất đơn: {html.escape(public_error_message(exc))}")
+    except Exception:
+        LOGGER.exception("Automatic pending purchase failed")
+        await notify_admin(
+            "⚠️ <b>XỬ LÝ ĐƠN HÀNG GẶP LỖI</b>\n\n"
+            f"👤 Telegram ID: <code>{telegram_id}</code>\n"
+            f"🧾 Mã đơn: <code>{html.escape(pending.order_id)}</code>"
+        )
+        if bot:
+            await bot.send_message(telegram_id, "❌ Có lỗi khi xử lý đơn hàng. Vui lòng kiểm tra mục Đơn hàng.")
+
+
+def parse_amount(text: str) -> int:
+    digits = re.sub(r"[^0-9]", "", text or "")
+    return int(digits) if digits else 0
+
+
+# ---------------------------------------------------------------------------
+# Catalog / ví / đơn hàng
+# ---------------------------------------------------------------------------
+
+def catalog_text(menu: CatalogMenu, page: int) -> str:
+    total_pages = max(1, (len(menu.products) + CATALOG_PAGE_SIZE - 1) // CATALOG_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    return (
+        f"{'🏪 <b>GIAN HÀNG CTV</b>' if menu.is_ctv else '📦 <b>DANH MỤC SẢN PHẨM</b>'}\n"
+        f"{UI_DIVIDER}\n"
+        f"🛒 {len(menu.products)} sản phẩm · Trang <b>{page + 1}/{total_pages}</b>\n\n"
+        + ("Giá hiển thị là giá nhập dành cho CTV." if menu.is_ctv else "Chọn sản phẩm để xem thông tin, thời hạn và cách nhận hàng.")
+    )
+
+
+async def show_home(
+    message: Message,
+    *,
+    edit: bool = False,
+    telegram_id: int | None = None,
+    display_name: str | None = None,
+    balance_data: dict[str, Any] | object = _UNSET,
+) -> Message:
+    user_id = telegram_id or message.from_user.id
+    if telegram_id is None:
+        remember_user(message.from_user)
+    else:
+        touch_user(user_id, display_name or "")
+    balance_label = "Đang cập nhật"
+    if balance_data is not _UNSET:
+        data = balance_data if isinstance(balance_data, dict) else {}
+        if "balance" in data:
+            balance_label = money(data.get("balance"))
+    else:
+        try:
+            data = await api.balance(user_id)
+            balance_label = money(data.get("balance"))
+        except ApiError as exc:
+            LOGGER.warning("Could not load balance for home screen: %s", exc.code)
+
+    name = html.escape(short_text(display_name or message.from_user.full_name or "bạn", 32))
+    text = (
+        "🛍 <b>SHOP TÀI KHOẢN</b>\n"
+        f"{UI_DIVIDER}\n"
+        f"👋 Xin chào <b>{name}</b>\n\n"
+        f"💰 Số dư hiện tại: <b>{balance_label}</b>\n"
+        "⚡ Giao thông tin tự động sau khi thanh toán\n"
+        "🔒 Đơn hàng và thông tin tài khoản được bảo mật\n\n"
+        "Chọn một chức năng bên dưới để bắt đầu.\n\n"
+        f"{support_line()}"
+    )
+    if edit:
+        return await edit_message_content(message, text, reply_markup=home_inline_keyboard(user_id))
+    return await message.answer(text, reply_markup=main_keyboard(user_id))
+
+async def show_catalog(
+    message: Message,
+    *,
+    edit: bool = False,
+    telegram_id: int | None = None,
+    catalog_data: dict[str, Any] | object = _UNSET,
+    ctv_mode: bool = False,
+) -> None:
+    try:
+        user_id = telegram_id or message.from_user.id
+        if telegram_id is None:
+            remember_user(message.from_user)
+        else:
+            touch_user(user_id)
+        data = catalog_data if catalog_data is not _UNSET and isinstance(catalog_data, dict) else await api.catalog(user_id, ctv_mode=ctv_mode)
+        products = [item for item in data.get("products", []) if isinstance(item, dict)]
+        menu = CatalogMenu(
+            key=secrets.token_hex(3),
+            products=products,
+            discount_percent=int(data.get("discountPercent") or 0),
+            created_at=time.time(),
+            is_ctv=ctv_mode,
+        )
+        menus[user_id] = menu
+        if not products:
+            text = (
+                "📦 <b>CHƯA CÓ SẢN PHẨM</b>\n"
+                f"{UI_DIVIDER}\n"
+                "Hiện chưa có sản phẩm phù hợp để hiển thị. Vui lòng thử làm mới sau."
+            )
+            if edit:
+                await edit_message_content(message, text, reply_markup=back_to_products_keyboard())
+            else:
+                await message.answer(text, reply_markup=main_keyboard(user_id))
+            return
+        text = catalog_text(menu, 0)
+        markup = catalog_keyboard(menu, 0)
+        if edit:
+            await edit_message_content(message, text, reply_markup=markup)
+        else:
+            await message.answer(text, reply_markup=markup)
+    except ApiError as exc:
+        await handle_api_error(message, exc)
+
+
+@dp.message(Command("start"))
+async def start_handler(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    user_id = message.from_user.id
+    try:
+        is_ctv = await api.ctv_status(user_id)
+        if is_ctv:
+            active_ctv_users.add(user_id)
+        else:
+            active_ctv_users.discard(user_id)
+    except ApiError as exc:
+        LOGGER.warning("Could not check CTV status for %s: %s", user_id, exc.code)
+    home_message = await show_home(message, balance_data={})
+
+    async def load_start_data() -> None:
+        balance_result, catalog_result = await asyncio.gather(
+            api.balance(user_id),
+            api.catalog(user_id),
+            return_exceptions=True,
+        )
+        balance_data: dict[str, Any] = {}
+        if isinstance(balance_result, Exception):
+            LOGGER.warning("Could not preload balance for /start: %s", getattr(balance_result, "code", "unknown"))
+        else:
+            balance_data = balance_result
+        try:
+            await show_home(
+                home_message,
+                edit=True,
+                telegram_id=user_id,
+                display_name=message.from_user.full_name,
+                balance_data=balance_data,
+            )
+        except Exception:
+            LOGGER.debug("Could not refresh the /start home message", exc_info=True)
+
+        if isinstance(catalog_result, Exception):
+            LOGGER.warning("Could not preload catalog for /start: %s", getattr(catalog_result, "code", "unknown"))
+            if isinstance(catalog_result, ApiError):
+                await handle_api_error(message, catalog_result)
+            return
+        try:
+            await show_catalog(message, catalog_data=catalog_result)
+        except Exception:
+            LOGGER.exception("Could not send the /start catalog")
+
+    asyncio.create_task(load_start_data())
+
+
+@dp.message(Command("home"))
+async def home_handler(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await show_home(message)
+
+
+@dp.message(Command("help"))
+@dp.message(F.text == "ℹ️ Trợ giúp")
+async def help_handler(message: Message) -> None:
+    remember_user(message.from_user)
+    await message.answer(
+        "ℹ️ <b>HƯỚNG DẪN MUA HÀNG</b>\n"
+        f"{UI_DIVIDER}\n"
+        "1️⃣ Mở 📦 <b>Sản phẩm</b> và chọn gói bạn cần.\n"
+        "2️⃣ Bấm <b>Mua ngay</b> hoặc nhập số lượng.\n"
+        "3️⃣ Nếu chưa đủ số dư, mở 💳 <b>Nạp tiền</b> và chuyển khoản đúng số tiền/nội dung.\n"
+        "4️⃣ Hệ thống tự xác nhận, xử lý đơn và gửi thông tin tài khoản.\n\n"
+        "Bạn có thể dùng các nút menu hoặc lệnh /products, /deposit, /balance, /orders.\n\n"
+        f"{support_line()}",
+        reply_markup=utility_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == "help")
+async def help_callback(callback: CallbackQuery) -> None:
+    await callback.answer()
+    if callback.message:
+        await callback.message.edit_text(
+            "ℹ️ <b>HƯỚNG DẪN MUA HÀNG</b>\n"
+            f"{UI_DIVIDER}\n"
+            "1️⃣ Chọn sản phẩm và kiểm tra thời hạn, số lượng còn lại.\n"
+            "2️⃣ Bấm <b>Mua ngay</b> hoặc nhập số lượng cần mua.\n"
+            "3️⃣ Nạp tiền bằng QR nếu số dư chưa đủ.\n"
+            "4️⃣ Sau khi thanh toán, bot tự xử lý và gửi thông tin đơn hàng.\n\n"
+            f"{support_line()}",
+            reply_markup=home_inline_keyboard(callback.from_user.id),
+        )
+
+
+@dp.message(Command("support"))
+@dp.message(F.text == "🆘 Hỗ trợ")
+async def support_handler(message: Message) -> None:
+    remember_user(message.from_user)
+    await message.answer(
+        "🆘 <b>HỖ TRỢ KHÁCH HÀNG</b>\n"
+        f"{UI_DIVIDER}\n"
+        "Nếu cần kiểm tra đơn, nạp tiền hoặc gặp lỗi khi nhận hàng, hãy liên hệ hỗ trợ và gửi mã đơn cho admin.\n\n"
+        f"{support_line()}",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="💬 Mở chat hỗ trợ", url=support_url())],
+                [InlineKeyboardButton(text="🏠 Trang chủ", callback_data="home")],
+            ]
+        ),
+    )
+
+
+@dp.message(Command("products"))
+@dp.message(F.text == "📦 Sản phẩm")
+async def products_handler(message: Message) -> None:
+    await show_catalog(message)
+
+
+async def open_ctv_shop(message: Message, telegram_id: int | None = None, *, edit: bool = False) -> None:
+    user_id = int(telegram_id or message.from_user.id)
+    try:
+        if not await api.ctv_status(user_id):
+            active_ctv_users.discard(user_id)
+            await message.answer("Tài khoản của bạn chưa được admin duyệt làm CTV.")
+            return
+        active_ctv_users.add(user_id)
+        await show_catalog(message, edit=edit, telegram_id=user_id, ctv_mode=True)
+    except ApiError as exc:
+        await message.answer(f"⚠️ {html.escape(public_error_message(exc))}")
+
+
+@dp.message(Command("ctv"))
+@dp.message(F.text == "🏪 Kênh CTV")
+async def ctv_shop_handler(message: Message) -> None:
+    await open_ctv_shop(message)
+
+
+@dp.callback_query(F.data == "ctv_open")
+async def ctv_shop_callback(callback: CallbackQuery) -> None:
+    await callback.answer()
+    if callback.message:
+        await open_ctv_shop(callback.message, callback.from_user.id, edit=True)
+
+
+@dp.message(Command("balance"))
+@dp.message(F.text == "💰 Số dư")
+async def balance_handler(message: Message, telegram_id: int | None = None) -> None:
+    try:
+        user_id = telegram_id or message.from_user.id
+        if telegram_id is None:
+            remember_user(message.from_user)
+        else:
+            touch_user(user_id)
+        data = await api.balance(user_id)
+        await message.answer(
+            "💰 <b>SỐ DƯ CỦA BẠN</b>\n"
+            f"{UI_DIVIDER}\n"
+            f"Ví hiện tại: <b>{money(data.get('balance'))}</b>\n\n"
+            "Bạn có thể dùng số dư này để mua sản phẩm trong shop.",
+            reply_markup=utility_keyboard(),
+        )
+    except ApiError as exc:
+        await handle_api_error(message, exc)
+
+
+@dp.message(Command("orders"))
+@dp.message(F.text == "🧾 Đơn hàng")
+async def orders_handler(message: Message, telegram_id: int | None = None) -> None:
+    try:
+        user_id = telegram_id or message.from_user.id
+        if telegram_id is None:
+            remember_user(message.from_user)
+        else:
+            touch_user(user_id)
+        data = await api.orders(user_id)
+        orders = [item for item in data.get("orders", []) if isinstance(item, dict)]
+        if not orders:
+            await message.answer(
+                "🧾 <b>LỊCH SỬ ĐƠN HÀNG</b>\n"
+                f"{UI_DIVIDER}\n"
+                "Bạn chưa có đơn hàng nào.",
+                reply_markup=utility_keyboard(),
+            )
+            return
+        lines = ["🧾 <b>LỊCH SỬ ĐƠN HÀNG</b>", UI_DIVIDER, ""]
+        for index, order in enumerate(orders[:10], start=1):
+            status = str(order.get("status") or "Đang xử lý")
+            sales_channel = " · 🤝 Đơn CTV" if str(order.get("salesChannel") or "") == "ctv" else ""
+            lines.append(
+                f"<b>{index}.</b> <code>{html.escape(str(order.get('orderId') or ''))}</code>\n"
+                f"📦 {html.escape(str(order.get('productName') or 'Sản phẩm'))}\n"
+                f"💵 {money(order.get('price'))} · SL {int(order.get('quantity') or 1)}\n"
+                f"{order_status_icon(status)} {html.escape(status)}{sales_channel} · {vi_time(order.get('timestamp'))}\n"
+            )
+        await answer_in_chunks(message, "\n".join(lines), main_keyboard(user_id))
+    except ApiError as exc:
+        await handle_api_error(message, exc)
+
+
+def admin_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📊 Làm mới thống kê", callback_data="admin_dashboard")],
+            [InlineKeyboardButton(text="👥 Danh sách khách hàng", callback_data="admin_users")],
+            [InlineKeyboardButton(text="💸 Cộng / trừ số dư", callback_data="admin_balance_adjust")],
+            [InlineKeyboardButton(text="📣 Gửi thông báo", callback_data="admin_broadcast")],
+            [InlineKeyboardButton(text="🏷️ Gán nhãn sản phẩm", callback_data="admin_badges")],
+            [InlineKeyboardButton(text="💾 Gửi backup ngay", callback_data="admin_backup_now")],
+            [InlineKeyboardButton(text="🏠 Trang chủ", callback_data="home")],
+        ]
+    )
+
+
+def admin_broadcast_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Gửi đến khách hàng", callback_data="admin_broadcast_confirm"),
+                InlineKeyboardButton(text="❌ Hủy", callback_data="admin_broadcast_cancel"),
+            ]
+        ]
+    )
+
+
+def admin_balance_action_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="➕ Cộng tiền", callback_data="admin_balance_action|credit"),
+                InlineKeyboardButton(text="➖ Trừ tiền", callback_data="admin_balance_action|debit"),
+            ],
+            [InlineKeyboardButton(text="❌ Hủy", callback_data="admin_balance_cancel")],
+        ]
+    )
+
+
+def admin_balance_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="❌ Hủy", callback_data="admin_balance_cancel")]]
+    )
+
+
+def admin_balance_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Xác nhận cập nhật số dư", callback_data="admin_balance_confirm")],
+            [InlineKeyboardButton(text="❌ Hủy", callback_data="admin_balance_cancel")],
+        ]
+    )
+
+
+def admin_badges_keyboard(menu: CatalogMenu) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for index, product in enumerate(menu.products):
+        custom_emoji_id = product_custom_emoji_id(product)
+        badge_prefix = "" if custom_emoji_id else f"{product_badge(product)} "
+        group_count = int(product.get("_badgeGroupCount") or 1)
+        group_suffix = f" · {group_count} sản phẩm" if group_count > 1 else ""
+        label = f"{badge_prefix}{short_text(product.get('name'), 22)}{group_suffix}"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=label,
+                    callback_data=f"admin_badge_select|{menu.key}|{index}",
+                    icon_custom_emoji_id=custom_emoji_id or None,
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton(text="🛠 Quản trị", callback_data="admin_dashboard")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def render_admin_badges(message: Message, admin_id: int, *, edit: bool = False) -> None:
+    if not is_admin(admin_id):
+        if edit:
+            await message.answer("Bạn không có quyền sử dụng chức năng này.")
+        else:
+            await message.answer("Bạn không có quyền sử dụng chức năng này.", reply_markup=main_keyboard(admin_id))
+        return
+    data = await api.catalog(admin_id)
+    catalog_products = [item for item in data.get("products", []) if isinstance(item, dict)]
+    grouped: dict[str, dict[str, Any]] = {}
+    for product in catalog_products:
+        name = " ".join(str(product.get("name") or "").split())
+        group_key = product_name_group_key(name)
+        group_id = group_key or product_key(product)
+        if not group_id:
+            continue
+        if group_id not in grouped:
+            grouped[group_id] = {**product, "_badgeGroupKey": group_id, "_badgeGroupCount": 1}
+        else:
+            grouped[group_id]["_badgeGroupCount"] += 1
+    products = list(grouped.values())
+    menu = CatalogMenu(
+        key=secrets.token_hex(3),
+        products=products,
+        discount_percent=int(data.get("discountPercent") or 0),
+        created_at=time.time(),
+    )
+    badge_menus[admin_id] = menu
+    text = (
+        "🏷️ <b>GÁN NHÃN SẢN PHẨM</b>\n"
+        f"{UI_DIVIDER}\n"
+        "Chọn tên sản phẩm rồi gửi emoji/icon muốn hiển thị trước tên. Các sản phẩm trùng tên dùng chung nhãn.\n"
+        "Ví dụ: chọn Adobe một lần để áp dụng cho mọi gói Adobe. Gửi <code>xóa</code> để bỏ nhãn nhóm."
+    )
+    if not products:
+        text += "\n\nHiện chưa có sản phẩm để gán nhãn."
+    if edit:
+        await message.edit_text(text, reply_markup=admin_badges_keyboard(menu) if products else admin_keyboard())
+    else:
+        await message.answer(text, reply_markup=admin_badges_keyboard(menu) if products else admin_keyboard())
+
+
+async def begin_admin_broadcast(message: Message, state: FSMContext, admin_id: int) -> None:
+    if not is_admin(admin_id):
+        await message.answer(
+            "Bạn không có quyền sử dụng chức năng gửi thông báo.",
+            reply_markup=main_keyboard(admin_id),
+        )
+        return
+    await state.clear()
+    await state.set_state(AdminStates.broadcast)
+    await message.answer(
+        "📣 <b>GỬI THÔNG BÁO CHO KHÁCH</b>\n"
+        f"{UI_DIVIDER}\n"
+        "Gửi một trong các dạng sau:\n"
+        "• Tin nhắn văn bản\n"
+        "• Ảnh kèm hoặc không kèm chú thích\n"
+        "• Video kèm hoặc không kèm chú thích\n\n"
+        "Bot sẽ hiển thị bản xem trước để bạn xác nhận trước khi gửi.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Hủy", callback_data="admin_broadcast_cancel")]]
+        ),
+    )
+
+
+async def admin_dashboard_view(admin_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    data = await api.admin_stats(admin_id)
+    summary = data.get("summary") if isinstance(data.get("summary"), dict) else {}
+    customers = [item for item in data.get("customers", []) if isinstance(item, dict)]
+    rows = merge_customer_records(customers)
+    customer_count = max(int(summary.get("customers") or 0), len(rows))
+    lines = [
+        "🛠 <b>BẢNG ĐIỀU KHIỂN SHOP</b>",
+        UI_DIVIDER,
+        "📊 <b>TỔNG QUAN</b>",
+        f"👥 Khách <b>{int(summary.get('customers') or 0)}</b>  ·  🧾 Đơn <b>{int(summary.get('orders') or 0)}</b>",
+        f"✅ Hoàn tất <b>{int(summary.get('completedOrders') or 0)}</b>  ·  💰 Doanh số <b>{money(summary.get('revenue'))}</b>",
+        f"💳 Lượt nạp <b>{int(summary.get('deposits') or 0)}</b>  ·  📥 Đã nạp <b>{money(summary.get('depositedAmount'))}</b>",
+        f"💼 Số dư ví <b>{money(summary.get('balances'))}</b>",
+        f"🛠 Cộng <b>{money(summary.get('manualCreditTotal'))}</b>  ·  Trừ <b>{money(summary.get('manualDebitTotal'))}</b>",
+        "",
+        "👤 <b>KHÁCH HOẠT ĐỘNG GẦN ĐÂY</b>",
+    ]
+    if not rows:
+        lines.append("Chưa có dữ liệu khách hàng.")
+    else:
+        lines.extend([
+            "Bấm vào tên khách để mở trang cá nhân Telegram.",
+            "",
+            customer_detail_text(rows[:5]),
+        ])
+        if customer_count > 5:
+            lines.extend(["", "Mở <b>Danh sách khách hàng</b> bên dưới để xem thêm."])
+    dashboard_buttons = [[InlineKeyboardButton(text="👥 Xem danh sách khách hàng", callback_data="admin_users")]]
+    dashboard_buttons.extend(admin_keyboard().inline_keyboard)
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=dashboard_buttons)
+
+
+async def admin_users_view(admin_id: int, page: int = 1) -> tuple[str, InlineKeyboardMarkup]:
+    data = await api.admin_stats(admin_id)
+    customers = [item for item in data.get("customers", []) if isinstance(item, dict)]
+    rows = merge_customer_records(customers)
+    summary = data.get("summary") if isinstance(data.get("summary"), dict) else {}
+    customer_count = max(int(summary.get("customers") or 0), len(rows))
+    visible_rows = rows
+    page_size = 10
+    page_count = max(1, (len(visible_rows) + page_size - 1) // page_size)
+    page = max(1, min(int(page or 1), page_count))
+    start = (page - 1) * page_size
+    page_rows = visible_rows[start:start + page_size]
+    lines = [
+        "👥 <b>DANH SÁCH KHÁCH HÀNG</b>",
+        UI_DIVIDER,
+        f"Đang xem <b>{start + 1 if page_rows else 0}–{start + len(page_rows)}</b> / <b>{customer_count}</b> khách",
+        "Mỗi khách hiển thị riêng một mục · bấm vào tên để mở trang cá nhân.",
+        "",
+    ]
+    if not rows:
+        lines.append("Chưa có khách hàng nào sử dụng bot.")
+    else:
+        lines.append(customer_detail_text(page_rows, start_index=start + 1))
+    return "\n".join(lines), admin_users_pagination_keyboard(page, page_count)
+
+
+@dp.message(Command("admin"))
+@dp.message(F.text == "🛠 Quản trị")
+async def admin_handler(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        await message.answer(
+            "Bạn không có quyền sử dụng mục này.\n"
+            f"ID Telegram của tài khoản này: <code>{message.from_user.id}</code>",
+            reply_markup=main_keyboard(message.from_user.id),
+        )
+        return
+    try:
+        text, markup = await admin_dashboard_view(message.from_user.id)
+        await message.answer(
+            text,
+            reply_markup=markup,
+        )
+    except ApiError as exc:
+        await handle_api_error(message, exc)
+
+
+def admin_balance_adjustment_error_message(exc: ApiError) -> str:
+    messages = {
+        "TELEGRAM_BOT_ADMIN_NOT_CONFIGURED": (
+            "Chưa cấu hình <code>TELEGRAM_BOT_ADMIN_IDS</code> trên Netlify. "
+            "Hãy đặt ID admin giống biến <code>ADMIN_TELEGRAM_IDS</code> của bot rồi deploy lại Netlify."
+        ),
+        "TELEGRAM_ADMIN_REQUIRED": "Telegram ID này chưa được cấp quyền điều chỉnh số dư trên Netlify.",
+        "TELEGRAM_MEMBER_NOT_FOUND": "Chưa tìm thấy khách trong bot. Hãy yêu cầu khách gửi /start trước.",
+        "INSUFFICIENT_BALANCE": "Số dư khách không đủ để trừ số tiền này.",
+        "TELEGRAM_BALANCE_INVALID": "Số dư khách hiện không hợp lệ, chưa thể điều chỉnh.",
+        "BALANCE_ADJUSTMENT_ID_CONFLICT": "Phiên xác nhận đã bị trùng với một thao tác khác. Hãy tạo lại thao tác.",
+    }
+    return messages.get(exc.code, exc.message)
+
+
+async def begin_admin_balance_adjustment(message: Message, state: FSMContext, admin_id: int) -> None:
+    if not is_admin(admin_id):
+        await message.answer(
+            "Bạn không có quyền cộng hoặc trừ số dư.",
+            reply_markup=main_keyboard(admin_id),
+        )
+        return
+    await state.clear()
+    await state.set_state(AdminStates.balance_target)
+    await message.answer(
+        "💸 <b>CỘNG / TRỪ SỐ DƯ KHÁCH</b>\n"
+        f"{UI_DIVIDER}\n"
+        "Gửi <b>Telegram ID</b> của khách cần điều chỉnh.\n"
+        "Khách cần từng gửi /start cho bot để có ví riêng.\n\n"
+        "Ví dụ: <code>123456789</code>",
+        reply_markup=admin_balance_cancel_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == "admin_balance_adjust")
+async def admin_balance_adjust_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Bạn không có quyền.", show_alert=True)
+        return
+    await callback.answer()
+    if callback.message:
+        await begin_admin_balance_adjustment(callback.message, state, callback.from_user.id)
+
+
+@dp.message(Command("money"))
+async def money_command_handler(message: Message, state: FSMContext) -> None:
+    await begin_admin_balance_adjustment(message, state, message.from_user.id)
+
+
+@dp.message(AdminStates.balance_target)
+async def admin_balance_target_handler(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    raw_target = str(message.text or "").strip()
+    if not re.fullmatch(r"\d{1,30}", raw_target) or int(raw_target) <= 0:
+        await message.answer("Telegram ID chỉ gồm chữ số. Vui lòng gửi lại ID của khách.")
+        return
+    await state.update_data(balance_target_telegram_id=raw_target)
+    await state.set_state(AdminStates.balance_action)
+    await message.answer(
+        "Chọn thao tác cho khách <code>" + html.escape(raw_target) + "</code>.",
+        reply_markup=admin_balance_action_keyboard(),
+    )
+
+
+@dp.callback_query(F.data.startswith("admin_balance_action|"))
+async def admin_balance_action_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Bạn không có quyền.", show_alert=True)
+        return
+    if await state.get_state() != AdminStates.balance_action.state:
+        await callback.answer("Phiên điều chỉnh đã hết hạn. Hãy mở lại mục Cộng / trừ số dư.", show_alert=True)
+        return
+    action = str(callback.data or "").split("|", 1)[-1]
+    if action not in {"credit", "debit"}:
+        await callback.answer("Thao tác không hợp lệ.", show_alert=True)
+        return
+    data = await state.get_data()
+    target = str(data.get("balance_target_telegram_id") or "")
+    if not re.fullmatch(r"\d{1,30}", target):
+        await state.clear()
+        await callback.answer("Không tìm thấy Telegram ID của khách. Hãy làm lại.", show_alert=True)
+        return
+    await state.update_data(balance_action=action)
+    await state.set_state(AdminStates.balance_amount)
+    action_text = "cộng" if action == "credit" else "trừ"
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer(
+            f"Nhập số tiền muốn <b>{action_text}</b> cho khách <code>{html.escape(target)}</code>.\n"
+            "Ví dụ: <code>50000</code>"
+        )
+
+
+@dp.message(AdminStates.balance_amount)
+async def admin_balance_amount_handler(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    amount = parse_amount(str(message.text or ""))
+    if amount <= 0:
+        await message.answer("Số tiền phải lớn hơn 0. Vui lòng nhập lại.")
+        return
+    if amount > 100_000_000:
+        await message.answer("Mỗi lần chỉ có thể cộng hoặc trừ tối đa 100.000.000đ.")
+        return
+    data = await state.get_data()
+    target = str(data.get("balance_target_telegram_id") or "")
+    action = str(data.get("balance_action") or "")
+    if not re.fullmatch(r"\d{1,30}", target) or action not in {"credit", "debit"}:
+        await state.clear()
+        await message.answer("Phiên điều chỉnh đã hết hạn. Hãy mở lại từ mục quản trị.", reply_markup=admin_keyboard())
+        return
+    await state.update_data(balance_amount=amount)
+    await state.set_state(AdminStates.balance_note)
+    await message.answer(
+        "Gửi ghi chú sẽ hiển thị cho khách (không bắt buộc).\n"
+        "Ví dụ: <code>Ưu đãi khách hàng</code>\n"
+        "Gửi <code>-</code> nếu không cần ghi chú.",
+        reply_markup=admin_balance_cancel_keyboard(),
+    )
+
+
+@dp.message(AdminStates.balance_note)
+async def admin_balance_note_handler(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    raw_note = str(message.text or "").strip()
+    note = "" if raw_note.casefold() in {"-", "bo qua", "bỏ qua", "skip", "none"} else raw_note
+    if len(note) > 300:
+        await message.answer("Ghi chú tối đa 300 ký tự. Vui lòng gửi lại hoặc gửi <code>-</code> để bỏ qua.")
+        return
+    data = await state.get_data()
+    target = str(data.get("balance_target_telegram_id") or "")
+    action = str(data.get("balance_action") or "")
+    try:
+        amount = int(data.get("balance_amount") or 0)
+    except (TypeError, ValueError):
+        amount = 0
+    if not re.fullmatch(r"\d{1,30}", target) or action not in {"credit", "debit"} or amount <= 0:
+        await state.clear()
+        await message.answer("Phiên điều chỉnh đã hết hạn. Hãy mở lại từ mục quản trị.", reply_markup=admin_keyboard())
+        return
+    request_id = "adj_" + secrets.token_urlsafe(18)
+    await state.update_data(balance_note=note, balance_request_id=request_id)
+    await state.set_state(AdminStates.balance_confirm)
+    action_text = "CỘNG" if action == "credit" else "TRỪ"
+    note_text = html.escape(note) if note else "Không có"
+    await message.answer(
+        "⚠️ <b>XÁC NHẬN CẬP NHẬT SỐ DƯ</b>\n"
+        f"{UI_DIVIDER}\n"
+        f"Khách: <code>{html.escape(target)}</code>\n"
+        f"Thao tác: <b>{action_text}</b>\n"
+        f"Số tiền: <b>{money(amount)}</b>\n"
+        f"Ghi chú: {note_text}\n\n"
+        "Thao tác sẽ lưu lịch sử và không thể tự hoàn tác. Hãy kiểm tra kỹ trước khi xác nhận.",
+        reply_markup=admin_balance_confirm_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == "admin_balance_confirm")
+async def admin_balance_confirm_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Bạn không có quyền.", show_alert=True)
+        return
+    if await state.get_state() != AdminStates.balance_confirm.state:
+        await callback.answer("Phiên điều chỉnh đã hết hạn. Hãy tạo thao tác mới.", show_alert=True)
+        return
+    data = await state.get_data()
+    target = str(data.get("balance_target_telegram_id") or "")
+    action = str(data.get("balance_action") or "")
+    note = str(data.get("balance_note") or "")
+    request_id = str(data.get("balance_request_id") or "")
+    try:
+        amount = int(data.get("balance_amount") or 0)
+    except (TypeError, ValueError):
+        amount = 0
+    if (
+        not re.fullmatch(r"\d{1,30}", target)
+        or action not in {"credit", "debit"}
+        or amount <= 0
+        or not re.fullmatch(r"[A-Za-z0-9_-]{12,80}", request_id)
+    ):
+        await state.clear()
+        await callback.answer("Dữ liệu xác nhận không hợp lệ. Hãy tạo thao tác mới.", show_alert=True)
+        return
+
+    await callback.answer("Đang cập nhật số dư…")
+    try:
+        result = await api.adjust_member_balance(
+            callback.from_user.id,
+            int(target),
+            action,
+            amount,
+            note,
+            request_id,
+        )
+        api.invalidate_balance(int(target))
+    except ApiError as exc:
+        await state.clear()
+        if callback.message:
+            await callback.message.edit_text(
+                "⚠️ <b>CHƯA CẬP NHẬT SỐ DƯ</b>\n"
+                f"{UI_DIVIDER}\n"
+                f"{admin_balance_adjustment_error_message(exc)}",
+                reply_markup=admin_keyboard(),
+            )
+        return
+
+    await state.clear()
+    action_text = "đã cộng" if action == "credit" else "đã trừ"
+    idempotent_note = (
+        "\n\nℹ️ Yêu cầu này đã được xác nhận trước đó; số dư không bị thay đổi lần hai."
+        if result.get("idempotent")
+        else ""
+    )
+    customer_notified = False
+    if not result.get("idempotent") and bot and int(target) != callback.from_user.id:
+        try:
+            customer_note = f"\n📝 Ghi chú: {html.escape(note)}" if note else ""
+            await bot.send_message(
+                int(target),
+                "💳 <b>SỐ DƯ ĐÃ ĐƯỢC CẬP NHẬT</b>\n"
+                f"{UI_DIVIDER}\n"
+                f"Admin {action_text} <b>{money(amount)}</b> vào ví của bạn.\n"
+                f"💰 Số dư hiện tại: <b>{money(result.get('balance'))}</b>"
+                f"{customer_note}",
+            )
+            customer_notified = True
+        except Exception:
+            LOGGER.warning("Could not notify Telegram user %s about manual balance adjustment", target)
+
+    notification_text = "Đã gửi thông báo cho khách." if customer_notified else "Không gửi được thông báo cho khách."
+    if int(target) == callback.from_user.id:
+        notification_text = "Đây là ví của chính bạn nên bot không gửi thông báo riêng."
+    if callback.message:
+        await callback.message.edit_text(
+            "✅ <b>ĐÃ CẬP NHẬT SỐ DƯ</b>\n"
+            f"{UI_DIVIDER}\n"
+            f"Khách: <code>{html.escape(target)}</code>\n"
+            f"Đã {action_text}: <b>{money(amount)}</b>\n"
+            f"Số dư trước: <b>{money(result.get('balanceBefore'))}</b>\n"
+            f"Số dư hiện tại: <b>{money(result.get('balance'))}</b>\n"
+            f"Mã tham chiếu: <code>{html.escape(str(result.get('id') or request_id))}</code>\n\n"
+            f"{notification_text}{idempotent_note}",
+            reply_markup=admin_keyboard(),
+        )
+
+
+@dp.callback_query(F.data == "admin_balance_cancel")
+async def admin_balance_cancel_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Bạn không có quyền.", show_alert=True)
+        return
+    await state.clear()
+    await callback.answer("Đã hủy.")
+    if callback.message:
+        await callback.message.edit_text("Đã hủy thao tác cộng / trừ số dư.", reply_markup=admin_keyboard())
+
+
+@dp.message(Command("backup"))
+async def backup_command_handler(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        await message.answer("Bạn không có quyền tạo backup.", reply_markup=main_keyboard(message.from_user.id))
+        return
+    sent = await send_database_backup_to_admin(message.from_user.id)
+    if sent:
+        await message.answer("✅ Đã gửi file backup .db vào chat admin của bạn.")
+    else:
+        await message.answer("⚠️ Chưa gửi được file backup. Hãy kiểm tra log Railway.")
+
+
+@dp.callback_query(F.data == "admin_backup_now")
+async def admin_backup_now_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Bạn không có quyền.", show_alert=True)
+        return
+    await callback.answer("Đang tạo và gửi backup…")
+    sent = await send_database_backup_to_admin(callback.from_user.id)
+    if callback.message:
+        await callback.message.answer(
+            "✅ Đã gửi file backup .db vào chat admin của bạn."
+            if sent
+            else "⚠️ Chưa gửi được file backup. Hãy kiểm tra log Railway."
+        )
+
+
+@dp.callback_query(F.data == "admin_dashboard")
+async def admin_dashboard_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Bạn không có quyền.", show_alert=True)
+        return
+    await callback.answer("Đang tải thống kê…")
+    try:
+        if callback.message:
+            text, markup = await admin_dashboard_view(callback.from_user.id)
+            await callback.message.edit_text(
+                text,
+                reply_markup=markup,
+            )
+    except ApiError as exc:
+        if callback.message:
+            await callback.message.answer(f"⚠️ {html.escape(public_error_message(exc))}")
+
+
+@dp.callback_query(F.data.startswith("admin_users"))
+async def admin_users_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Bạn không có quyền.", show_alert=True)
+        return
+    await callback.answer("Đang tải danh sách…")
+    try:
+        page = int(str(callback.data or "admin_users").split("|", 1)[1]) if "|" in str(callback.data or "") else 1
+        text, markup = await admin_users_view(callback.from_user.id, page)
+        if callback.message:
+            await callback.message.edit_text(text, reply_markup=markup)
+    except ApiError as exc:
+        if callback.message:
+            await callback.message.answer(f"⚠️ {html.escape(public_error_message(exc))}")
+    except Exception:
+        LOGGER.exception("Could not open admin customer list for %s", callback.from_user.id)
+        if callback.message:
+            await callback.message.answer(
+                "⚠️ Không mở được danh sách khách hàng. Hãy thử lại hoặc kiểm tra log bot.",
+                reply_markup=admin_keyboard(),
+            )
+
+
+@dp.callback_query(F.data == "admin_badges")
+async def admin_badges_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Bạn không có quyền.", show_alert=True)
+        return
+    await callback.answer("Đang tải sản phẩm…")
+    try:
+        if callback.message:
+            await render_admin_badges(callback.message, callback.from_user.id, edit=True)
+    except ApiError as exc:
+        if callback.message:
+            await callback.message.answer(f"⚠️ {html.escape(public_error_message(exc))}")
+
+
+@dp.message(Command("badges"))
+async def badges_command_handler(message: Message) -> None:
+    try:
+        await render_admin_badges(message, message.from_user.id)
+    except ApiError as exc:
+        await handle_api_error(message, exc)
+
+
+@dp.callback_query(F.data.startswith("admin_badge_select|"))
+async def admin_badge_select_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Bạn không có quyền.", show_alert=True)
+        return
+    parts = str(callback.data or "").split("|")
+    if len(parts) != 3:
+        await callback.answer("Dữ liệu không hợp lệ.", show_alert=True)
+        return
+    menu = badge_menus.get(callback.from_user.id)
+    if not menu or menu.key != parts[1] or time.time() - menu.created_at > 30 * 60:
+        await callback.answer("Danh sách sản phẩm đã hết hạn, hãy mở lại.", show_alert=True)
+        return
+    try:
+        product = menu.products[int(parts[2])]
+    except (ValueError, IndexError):
+        await callback.answer("Sản phẩm không hợp lệ.", show_alert=True)
+        return
+    badge_key = str(product.get("_badgeGroupKey") or product_name_group_key(product.get("name")))
+    if not badge_key:
+        await callback.answer("Sản phẩm chưa có mã nhận diện.", show_alert=True)
+        return
+    await state.set_state(AdminStates.product_badge)
+    await state.update_data(
+        badge_key=badge_key,
+        product_name=str(product.get("name") or "Sản phẩm"),
+        product_count=int(product.get("_badgeGroupCount") or 1),
+    )
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer(
+            "🏷️ <b>GÁN NHÃN SẢN PHẨM</b>\n"
+            f"{UI_DIVIDER}\n"
+            f"Nhóm sản phẩm: <b>{html.escape(str(product.get('name') or 'Sản phẩm'))}</b>\n"
+            f"Áp dụng cho: <b>{int(product.get('_badgeGroupCount') or 1)} sản phẩm cùng tên</b>\n\n"
+            "Gửi emoji/icon thường, emoji động tùy chỉnh, hoặc sticker động.\n"
+            "Emoji động sẽ hiển thị trực tiếp trên nút sản phẩm; sticker sẽ được gửi riêng khi khách mở sản phẩm.\n"
+            "Gửi <code>xóa</code> để bỏ nhãn tùy chỉnh."
+        )
+
+
+@dp.message(AdminStates.product_badge)
+async def admin_badge_message_handler(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    data = await state.get_data()
+    badge_key = str(data.get("badge_key") or "")
+    product_name = str(data.get("product_name") or "Sản phẩm")
+    product_count = max(1, int(data.get("product_count") or 1))
+    if not badge_key:
+        await state.clear()
+        await message.answer("Phiên gán nhãn đã hết hạn.", reply_markup=admin_keyboard())
+        return
+
+    if message.sticker:
+        badge = json.dumps(
+            {
+                "type": "telegram_sticker",
+                "file_id": str(message.sticker.file_id),
+                "emoji": normalize_product_badge(str(message.sticker.emoji or "🏷️")) or "🏷️",
+            },
+            ensure_ascii=False,
+        )
+    elif message.text and message.entities:
+        custom_emoji_entity = next(
+            (
+                entity
+                for entity in message.entities
+                if str(getattr(entity.type, "value", entity.type)) == "custom_emoji"
+                and str(entity.custom_emoji_id or "").strip()
+            ),
+            None,
+        )
+        if custom_emoji_entity:
+            badge = json.dumps(
+                {
+                    "type": "telegram_custom_emoji",
+                    "custom_emoji_id": str(custom_emoji_entity.custom_emoji_id),
+                    "emoji": normalize_product_badge(str(message.text or "🏷️")) or "🏷️",
+                },
+                ensure_ascii=False,
+            )
+        else:
+            badge = ""
+    elif message.text:
+        raw = str(message.text).strip()
+        if raw.casefold() in {"xóa", "xoa", "remove", "none", "default"}:
+            badge = ""
+        else:
+            badge = normalize_product_badge(raw)
+    else:
+        await message.answer("Vui lòng gửi emoji, icon dạng chữ hoặc sticker.")
+        return
+
+    if message.text and not badge and str(message.text).strip().casefold() not in {"xóa", "xoa", "remove", "none", "default"}:
+        await message.answer("Nhãn không hợp lệ. Hãy gửi một emoji/icon ngắn.")
+        return
+    save_product_badge(badge_key, badge or None)
+    try:
+        await api.save_product_badge(
+            message.from_user.id,
+            badge_key,
+            stored_product_badge(badge or None) or None,
+        )
+    except ApiError as exc:
+        LOGGER.warning("Could not persist product badge %s: %s", badge_key, exc.code)
+        await state.clear()
+        await message.answer(
+            f"⚠️ Đã đổi icon trong phiên hiện tại nhưng chưa lưu bền vững ({html.escape(exc.code)}). "
+            "Kiểm tra backend Netlify rồi gán lại icon để đồng bộ qua các lần deploy.",
+            reply_markup=admin_keyboard(),
+        )
+        return
+    await state.clear()
+    sticker = sticker_badge_data(badge or "")
+    custom_emoji = custom_emoji_badge_data(badge or "")
+    result = (
+        "đã bỏ về icon mặc định"
+        if not badge
+        else (
+            f"đã gán sticker {html.escape(sticker['emoji'])} (bot sẽ gửi sticker riêng khi khách mở sản phẩm)"
+            if sticker
+            else (
+                f"đã gán emoji động {html.escape(custom_emoji['emoji'])}"
+                if custom_emoji
+                else f"đã đặt thành {html.escape(badge)}"
+            )
+        )
+    )
+    await message.answer(
+        f"✅ Nhãn nhóm <b>{html.escape(product_name)}</b> ({product_count} sản phẩm) {result}.",
+        reply_markup=admin_keyboard(),
+    )
+
+
+@dp.message(Command("users"))
+async def users_command_handler(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        await message.answer(
+            "Bạn không có quyền xem danh sách khách hàng.",
+            reply_markup=main_keyboard(message.from_user.id),
+        )
+        return
+    try:
+        text, markup = await admin_users_view(message.from_user.id)
+        await message.answer(text, reply_markup=markup)
+    except ApiError as exc:
+        await handle_api_error(message, exc)
+
+
+@dp.callback_query(F.data == "admin_broadcast")
+async def admin_broadcast_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Bạn không có quyền.", show_alert=True)
+        return
+    await callback.answer()
+    if callback.message:
+        await begin_admin_broadcast(callback.message, state, callback.from_user.id)
+
+
+@dp.message(Command("broadcast"))
+async def broadcast_command_handler(message: Message, state: FSMContext) -> None:
+    await begin_admin_broadcast(message, state, message.from_user.id)
+
+
+@dp.message(AdminStates.broadcast)
+async def admin_broadcast_message_handler(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    kind = ""
+    file_id = ""
+    content = ""
+    if message.photo:
+        kind = "photo"
+        file_id = message.photo[-1].file_id
+        content = str(message.caption or "").strip()
+    elif message.video:
+        kind = "video"
+        file_id = message.video.file_id
+        content = str(message.caption or "").strip()
+    elif message.text:
+        kind = "text"
+        content = message.text
+    else:
+        await message.answer("Chỉ hỗ trợ tin nhắn văn bản, ảnh hoặc video. Vui lòng gửi lại.")
+        return
+    if kind in {"photo", "video"} and len(content) > 1024:
+        await message.answer("Chú thích ảnh/video tối đa 1024 ký tự. Vui lòng gửi lại nội dung ngắn hơn.")
+        return
+
+    await state.update_data(kind=kind, file_id=file_id, content=content)
+    await state.set_state(AdminStates.confirm_broadcast)
+    type_label = {"text": "Tin nhắn văn bản", "photo": "Ảnh", "video": "Video"}[kind]
+    preview = content[:1200] if content else "(Không có nội dung chú thích)"
+    await message.answer(
+        "📣 <b>XEM TRƯỚC THÔNG BÁO</b>\n"
+        f"{UI_DIVIDER}\n"
+        f"Loại: <b>{type_label}</b>\n"
+        f"Nội dung:\n<pre>{html.escape(preview)}</pre>\n"
+        "Nếu đúng, bấm gửi để phát đến toàn bộ khách đã từng dùng bot.",
+        reply_markup=admin_broadcast_keyboard(),
+    )
+
+
+async def broadcast_recipient_ids(admin_id: int) -> list[int]:
+    recipients = set(local_users())
+    try:
+        data = await api.admin_stats(admin_id)
+        customers = data.get("customers", [])
+        for customer in customers if isinstance(customers, list) else []:
+            if not isinstance(customer, dict):
+                continue
+            try:
+                user_id = int(customer.get("telegramId") or 0)
+            except (TypeError, ValueError):
+                continue
+            if user_id > 0:
+                recipients.add(user_id)
+    except ApiError as exc:
+        LOGGER.warning("Could not load backend customers for broadcast: %s", exc.code)
+    return sorted(user_id for user_id in recipients if not is_admin(user_id))
+
+
+async def broadcast_payload(payload: dict[str, Any], admin_id: int) -> tuple[int, int]:
+    global bot
+    if not bot:
+        return 0, 0
+    sent = 0
+    failed = 0
+    for user_id in await broadcast_recipient_ids(admin_id):
+        try:
+            kind = str(payload.get("kind") or "")
+            content = str(payload.get("content") or "")
+            if kind == "photo":
+                await bot.send_photo(
+                    user_id,
+                    photo=str(payload.get("file_id") or ""),
+                    caption=content or None,
+                    parse_mode=None,
+                )
+            elif kind == "video":
+                await bot.send_video(
+                    user_id,
+                    video=str(payload.get("file_id") or ""),
+                    caption=content or None,
+                    parse_mode=None,
+                )
+            else:
+                await bot.send_message(user_id, content, parse_mode=None)
+            sent += 1
+        except Exception:
+            failed += 1
+            LOGGER.warning("Could not broadcast to Telegram user %s", user_id)
+        await asyncio.sleep(0.06)
+    return sent, failed
+
+
+def provider_restock_messages(changes: list[dict[str, Any]]) -> list[str]:
+    header = "📦 <b>SẢN PHẨM VỪA CÓ THÊM HÀNG</b>\n" + UI_DIVIDER + "\n\n"
+    messages: list[str] = []
+    current = header
+    for item in changes:
+        block = (
+            f"🛍 <b>{html.escape(str(item.get('name') or 'Sản phẩm'))}</b>\n"
+            f"📈 Vừa thêm: <b>+{int(item.get('added') or 0)}</b> · Hiện còn: <b>{int(item.get('quantity') or 0)}</b>\n"
+            f"⏳ Thời hạn: <b>{html.escape(str(item.get('duration') or 'Theo mô tả sản phẩm'))}</b>\n\n"
+        )
+        if len(current) + len(block) > 3600 and current != header:
+            messages.append(current.rstrip())
+            current = header
+        current += block
+    if current != header:
+        messages.append(current.rstrip())
+    return messages
+
+
+async def send_provider_restock_notifications(
+    changes: list[dict[str, Any]],
+    watcher_id: int,
+) -> None:
+    global bot
+    if not changes:
+        return
+    messages = provider_restock_messages(changes)
+    if not messages:
+        return
+
+    if bot:
+        try:
+            recipients = await broadcast_recipient_ids(watcher_id)
+        except Exception:
+            LOGGER.exception("Could not load recipients for provider restock notice")
+            recipients = []
+        markup = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🛍 Xem sản phẩm", callback_data="products")]]
+        )
+        sent = 0
+        failed = 0
+        for user_id in recipients:
+            try:
+                for index, content in enumerate(messages):
+                    await bot.send_message(
+                        user_id,
+                        content,
+                        reply_markup=markup if index == len(messages) - 1 else None,
+                    )
+                sent += 1
+            except Exception:
+                failed += 1
+                LOGGER.info("Could not send provider restock notice to Telegram user %s", user_id)
+            await asyncio.sleep(0.06)
+        LOGGER.info("Provider restock notice sent to %s users; %s failed", sent, failed)
+
+    for content in messages:
+        await notify_admin(content)
+
+
+async def provider_stock_watch_loop() -> None:
+    while True:
+        try:
+            users = local_users()
+            watcher_id = ADMIN_TELEGRAM_ID or next(iter(users), 0)
+            if watcher_id <= 0:
+                await asyncio.sleep(PROVIDER_STOCK_POLL_SECONDS)
+                continue
+
+            catalog_data = await api.catalog(watcher_id)
+            catalog_products = catalog_data.get("products", [])
+            products = [
+                item for item in catalog_products
+                if isinstance(item, dict)
+                and str(item.get("deliveryMode") or item.get("sourceMode") or "") == "provider"
+                and product_key(item)
+            ]
+            current: dict[str, dict[str, Any]] = {}
+            for product in products:
+                key = product_key(product)
+                current[key] = {
+                    "quantity": max(0, int(float(product.get("quantity") or 0))),
+                    "name": str(product.get("name") or "Sản phẩm")[:180],
+                    "duration": str(product.get("duration") or "Theo mô tả sản phẩm")[:160],
+                }
+
+            initialized, previous = await asyncio.to_thread(load_provider_stock_snapshots)
+            if not initialized:
+                await asyncio.to_thread(save_provider_stock_snapshots, current)
+                LOGGER.info("Provider stock monitor initialized with %s products", len(current))
+            else:
+                changes = []
+                for product_id, item in current.items():
+                    old_quantity = int(previous.get(product_id, {}).get("quantity") or 0)
+                    quantity = int(item["quantity"])
+                    if quantity > old_quantity:
+                        changes.append({
+                            "id": product_id,
+                            "name": item["name"],
+                            "duration": item["duration"],
+                            "added": quantity - old_quantity,
+                            "quantity": quantity,
+                        })
+                await asyncio.to_thread(save_provider_stock_snapshots, current)
+                if changes:
+                    LOGGER.info("Detected provider restock for %s products", len(changes))
+                    await send_provider_restock_notifications(changes, watcher_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.exception("Provider stock monitor could not refresh product quantities")
+        await asyncio.sleep(PROVIDER_STOCK_POLL_SECONDS)
+
+
+@dp.callback_query(F.data == "admin_broadcast_confirm")
+async def admin_broadcast_confirm_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Bạn không có quyền.", show_alert=True)
+        return
+    payload = await state.get_data()
+    if not payload.get("kind"):
+        await state.clear()
+        await callback.answer("Nội dung thông báo đã hết hạn.", show_alert=True)
+        return
+    await callback.answer("Đang gửi thông báo…")
+    if callback.message:
+        await callback.message.edit_text("⏳ <b>ĐANG GỬI THÔNG BÁO…</b>\nVui lòng chờ bot hoàn tất.")
+    sent, failed = await broadcast_payload(payload, callback.from_user.id)
+    await state.clear()
+    if callback.message:
+        await callback.message.edit_text(
+            "✅ <b>ĐÃ GỬI THÔNG BÁO</b>\n"
+            f"{UI_DIVIDER}\n"
+            f"Gửi thành công: <b>{sent}</b>\n"
+            f"Không gửi được: <b>{failed}</b>",
+            reply_markup=admin_keyboard(),
+        )
+
+
+@dp.callback_query(F.data == "admin_broadcast_cancel")
+async def admin_broadcast_cancel_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Bạn không có quyền.", show_alert=True)
+        return
+    await state.clear()
+    await callback.answer("Đã hủy.")
+    if callback.message:
+        await callback.message.edit_text("Đã hủy gửi thông báo.", reply_markup=admin_keyboard())
+
+
+# ---------------------------------------------------------------------------
+# Nạp tiền tự động qua VietQR + SePay
+# ---------------------------------------------------------------------------
+
+def deposit_keyboard(memo: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Tôi đã chuyển khoản", callback_data=f"deposit_check|{memo}")],
+            [InlineKeyboardButton(text="💰 Kiểm tra số dư", callback_data="balance")],
+            [InlineKeyboardButton(text="🆘 Hỗ trợ", url=support_url())],
+        ]
+    )
+
+
+def purchase_qr_keyboard(memo: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Tôi đã chuyển khoản", callback_data=f"deposit_check|{memo}")],
+            [InlineKeyboardButton(text="🧾 Xem đơn hàng", callback_data="orders")],
+            [InlineKeyboardButton(text="🆘 Hỗ trợ", url=support_url())],
+        ]
+    )
+
+
+async def create_and_send_deposit_qr(
+    message: Message,
+    telegram_id: int,
+    amount: int,
+    *,
+    pending: PendingPurchase | None = None,
+) -> dict[str, Any]:
+    data = await api.create_deposit(telegram_id, amount)
+    memo = str(data.get("memo") or "")
+    expires_at = int(data.get("expiresAt") or 0)
+    bank = data.get("bank") if isinstance(data.get("bank"), dict) else {}
+    is_purchase = pending is not None
+    if pending:
+        pending_purchases[telegram_id] = pending
+        caption = (
+            "📲 <b>THANH TOÁN ĐƠN HÀNG BẰNG QR</b>\n"
+            f"{UI_DIVIDER}\n\n"
+            f"Mã đơn: <code>{html.escape(pending.order_id)}</code>\n"
+            f"Sản phẩm: <b>{html.escape(pending.product_name)}</b>\n"
+            f"Số lượng: <b>{pending.quantity}</b>\n"
+            f"Số tiền cần chuyển: <b>{money(data.get('amount') or amount)}</b>\n\n"
+        )
+    else:
+        caption = (
+            "💳 <b>QUÉT QR ĐỂ NẠP TIỀN</b>\n"
+            f"{UI_DIVIDER}\n\n"
+            f"Số tiền: <b>{money(data.get('amount') or amount)}</b>\n"
+        )
+    caption += (
+        f"Ngân hàng: <b>MB Bank</b>\n"
+        f"Số tài khoản: <code>{html.escape(str(bank.get('account') or ''))}</code>\n"
+        f"Chủ tài khoản: <b>{html.escape(str(bank.get('accountName') or ''))}</b>\n"
+        f"Nội dung chuyển khoản: <code>{html.escape(memo)}</code>\n\n"
+        "Giữ nguyên số tiền và nội dung chuyển khoản. Hệ thống sẽ tự động xác nhận sau khi nhận được tiền.\n\n"
+        f"{support_line()}"
+    )
+    markup = purchase_qr_keyboard(memo) if is_purchase else deposit_keyboard(memo)
+    qr_url = str(data.get("qrUrl") or "")
+    if qr_url:
+        await message.answer_photo(photo=URLInputFile(qr_url), caption=caption, reply_markup=markup)
+    else:
+        await message.answer(caption, reply_markup=markup)
+
+    if is_purchase:
+        await notify_admin(
+            "📲 <b>CÓ YÊU CẦU THANH TOÁN ĐƠN HÀNG QUA QR</b>\n\n"
+            f"👤 Telegram ID: <code>{telegram_id}</code>\n"
+            f"🧾 Mã đơn: <code>{html.escape(pending.order_id)}</code>\n"
+            f"📦 Sản phẩm: <b>{html.escape(pending.product_name)}</b>\n"
+            f"💰 Số tiền: <b>{money(data.get('amount') or amount)}</b>\n"
+            f"📝 Mã nạp: <code>{html.escape(memo)}</code>"
+        )
+    else:
+        await notify_admin(
+            "📥 <b>CÓ YÊU CẦU NẠP TIỀN MỚI</b>\n\n"
+            f"👤 Telegram ID: <code>{telegram_id}</code>\n"
+            f"💰 Số tiền: <b>{money(data.get('amount') or amount)}</b>\n"
+            f"📝 Mã nạp: <code>{html.escape(memo)}</code>"
+        )
+
+    key = (telegram_id, memo)
+    old_task = deposit_watch_tasks.pop(key, None)
+    if old_task:
+        old_task.cancel()
+    deposit_watch_tasks[key] = asyncio.create_task(watch_deposit(telegram_id, memo, expires_at))
+    return data
+
+
+async def notify_deposit_paid(telegram_id: int, data: dict[str, Any]) -> None:
+    global bot
+    if not bot:
+        return
+    memo = str(data.get("memo") or "")
+    api.invalidate_balance(telegram_id)
+    key = (telegram_id, memo)
+    if key in deposit_notified:
+        return
+    deposit_notified.add(key)
+    pending = pending_purchases.pop(telegram_id, None)
+    pending_note = "\n\n⏳ Bot sẽ tự động tiếp tục đơn hàng bạn vừa chọn." if pending else ""
+    await bot.send_message(
+        telegram_id,
+        "✅ <b>NẠP TIỀN THÀNH CÔNG</b>\n"
+        f"{UI_DIVIDER}\n\n"
+        f"Đã cộng: <b>+{money(data.get('amount'))}</b>\n"
+        f"Số dư mới: <b>{money(data.get('balance'))}</b>\n"
+        f"Mã nạp: <code>{html.escape(memo)}</code>{pending_note}\n\n"
+        f"{support_line()}",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="📦 Mua ngay", callback_data="products"),
+                    InlineKeyboardButton(text="💰 Số dư", callback_data="balance"),
+                ],
+                [InlineKeyboardButton(text="🏠 Trang chủ", callback_data="home")],
+            ]
+        ),
+    )
+    await notify_admin(
+        "💳 <b>KHÁCH NẠP TIỀN TỰ ĐỘNG</b>\n\n"
+        f"👤 Telegram ID: <code>{telegram_id}</code>\n"
+        f"💰 Số tiền: <b>{money(data.get('amount'))}</b>\n"
+        f"📝 Mã nạp: <code>{html.escape(memo)}</code>"
+    )
+    if pending:
+        asyncio.create_task(resume_pending_purchase(telegram_id, pending))
+
+
+async def watch_deposit(telegram_id: int, memo: str, expires_at: int) -> None:
+    key = (telegram_id, memo)
+    deadline = min(time.time() + DEPOSIT_WATCH_SECONDS, max(time.time(), expires_at / 1000))
+    try:
+        while time.time() < deadline:
+            try:
+                data = await api.deposit_status(telegram_id, memo)
+                status = str(data.get("status") or "")
+                if "Auto" in status or status.startswith("Đã duyệt") or int(data.get("creditedAt") or 0) > 0:
+                    await notify_deposit_paid(telegram_id, data)
+                    return
+            except ApiError as exc:
+                LOGGER.warning("Deposit watch failed for %s: %s", memo, exc.code)
+            await asyncio.sleep(DEPOSIT_POLL_SECONDS)
+    finally:
+        deposit_watch_tasks.pop(key, None)
+
+
+@dp.message(Command("deposit"))
+@dp.message(F.text == "💳 Nạp tiền")
+async def deposit_handler(message: Message, state: FSMContext, telegram_id: int | None = None) -> None:
+    user_id = telegram_id or message.from_user.id
+    if telegram_id is None:
+        remember_user(message.from_user)
+    else:
+        touch_user(user_id)
+    await state.clear()
+    await state.set_state(DepositStates.amount)
+    await message.answer(
+        "💳 <b>NẠP TIỀN TỰ ĐỘNG</b>\n"
+        f"{UI_DIVIDER}\n"
+        f"Nhập số tiền muốn nạp, {deposit_requirement_text()}.\n"
+        "Ví dụ: <code>50000</code>\n\n"
+        "Sau đó quét QR và giữ nguyên nội dung chuyển khoản để hệ thống nhận diện nhanh.\n\n"
+        f"{support_line()}",
+        reply_markup=main_keyboard(user_id),
+    )
+
+
+@dp.message(DepositStates.amount)
+async def deposit_amount_handler(message: Message, state: FSMContext) -> None:
+    remember_user(message.from_user)
+    amount = parse_amount(str(message.text or ""))
+    if amount <= 0:
+        await message.answer("Số tiền phải lớn hơn 0. Vui lòng nhập lại.")
+        return
+    if MIN_DEPOSIT > 0 and amount < MIN_DEPOSIT:
+        await message.answer(f"Số tiền tối thiểu là {money(MIN_DEPOSIT)}. Vui lòng nhập lại.")
+        return
+    try:
+        await state.clear()
+        await create_and_send_deposit_qr(message, message.from_user.id, amount)
+    except ApiError as exc:
+        await state.clear()
+        await handle_api_error(message, exc)
+
+
+@dp.callback_query(F.data.startswith("deposit_check|"))
+async def deposit_check_callback(callback: CallbackQuery) -> None:
+    memo = str(callback.data or "").split("|", 1)[-1]
+    await callback.answer("Đang kiểm tra giao dịch…")
+    try:
+        data = await api.deposit_status(callback.from_user.id, memo)
+        status = str(data.get("status") or "Chờ duyệt")
+        if "Auto" in status or status.startswith("Đã duyệt") or int(data.get("creditedAt") or 0) > 0:
+            await notify_deposit_paid(callback.from_user.id, data)
+            if callback.message:
+                await callback.message.answer("✅ Khoản nạp đã được xác nhận và cộng vào số dư.")
+        elif callback.message:
+            await callback.message.answer("Chưa thấy giao dịch. Hãy kiểm tra đúng số tiền và nội dung chuyển khoản.")
+    except ApiError as exc:
+        if callback.message:
+            await callback.message.answer(f"⚠️ {html.escape(exc.message)}")
+
+
+# ---------------------------------------------------------------------------
+# Sản phẩm và mua hàng
+# ---------------------------------------------------------------------------
+
+@dp.callback_query(F.data.startswith("catalog|"))
+async def catalog_page_callback(callback: CallbackQuery) -> None:
+    if not callback.message:
+        await callback.answer()
+        return
+    parts = str(callback.data or "").split("|")
+    if len(parts) != 3:
+        await callback.answer("Dữ liệu không hợp lệ.", show_alert=True)
+        return
+    menu = menu_for_user(callback.from_user.id)
+    if not menu or menu.key != parts[1]:
+        await callback.answer("Danh sách đã cũ, vui lòng làm mới.", show_alert=True)
+        return
+    try:
+        page = int(parts[2])
+    except ValueError:
+        await callback.answer("Trang không hợp lệ.", show_alert=True)
+        return
+    total_pages = max(1, (len(menu.products) + CATALOG_PAGE_SIZE - 1) // CATALOG_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    await callback.answer()
+    await edit_message_content(
+        callback.message,
+        catalog_text(menu, page),
+        reply_markup=catalog_keyboard(menu, page),
+    )
+
+
+@dp.callback_query(F.data.startswith("product|"))
+async def product_detail_callback(callback: CallbackQuery) -> None:
+    if not callback.message:
+        await callback.answer()
+        return
+    parts = str(callback.data or "").split("|")
+    if len(parts) != 3:
+        await callback.answer("Dữ liệu không hợp lệ.", show_alert=True)
+        return
+    menu = menu_for_user(callback.from_user.id)
+    if not menu or menu.key != parts[1]:
+        await callback.answer("Danh sách đã cũ, vui lòng mở lại sản phẩm.", show_alert=True)
+        return
+    try:
+        index = int(parts[2])
+        product = menu.products[index]
+    except (ValueError, IndexError):
+        await callback.answer("Sản phẩm không còn trong danh sách.", show_alert=True)
+        return
+    await callback.answer()
+    reply_markup = product_detail_keyboard(menu, index, product)
+    image_url = product_image_url(product)
+    sticker_file_id = product_sticker_file_id(product)
+    if sticker_file_id:
+        try:
+            await callback.message.answer_sticker(sticker=sticker_file_id)
+        except Exception:
+            # Sticker errors should never block product details or checkout.
+            LOGGER.warning("Could not send sticker for product %s", product_key(product), exc_info=True)
+    if not image_url:
+        await edit_message_content(
+            callback.message,
+            product_text(product, menu.discount_percent, ctv_mode=menu.is_ctv),
+            reply_markup=reply_markup,
+        )
+        return
+
+    try:
+        # Tin nhắn cũ là danh sách sản phẩm; xóa để ảnh chi tiết xuất hiện gọn
+        # trong khung chat thay vì để lại một URL hoặc một tin nhắn chữ riêng.
+        await callback.message.delete()
+        await callback.message.answer_photo(
+            photo=URLInputFile(image_url),
+            caption=product_photo_caption(product, menu.discount_percent, ctv_mode=menu.is_ctv),
+            reply_markup=reply_markup,
+        )
+    except Exception:
+        LOGGER.warning("Could not display product image from %s", image_url, exc_info=True)
+        # Nếu nguồn ảnh không cho Telegram tải (SVG, hotlink bị chặn, URL lỗi...),
+        # vẫn giữ luồng mua hàng bằng tin nhắn chi tiết dạng chữ.
+        await callback.message.answer(
+            product_text(product, menu.discount_percent, ctv_mode=menu.is_ctv),
+            reply_markup=reply_markup,
+        )
+
+
+@dp.callback_query(F.data.startswith("quantity|"))
+async def quantity_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    parts = str(callback.data or "").split("|")
+    if len(parts) != 3:
+        await callback.answer("Dữ liệu không hợp lệ.", show_alert=True)
+        return
+    menu = menu_for_user(callback.from_user.id)
+    if not menu or menu.key != parts[1]:
+        await callback.answer("Danh sách đã cũ, vui lòng mở lại sản phẩm.", show_alert=True)
+        return
+    try:
+        index = int(parts[2])
+        product = menu.products[index]
+    except (ValueError, IndexError):
+        await callback.answer("Sản phẩm không còn trong danh sách.", show_alert=True)
+        return
+    limit = min(MAX_QUANTITY, max(1, int(product.get("quantity") or 0)))
+    await state.set_state(QuantityStates.quantity)
+    await state.update_data(menu_key=menu.key, index=index)
+    if callback.message:
+        await callback.message.answer(
+            f"🔢 Nhập số lượng cho <b>{html.escape(str(product.get('name') or 'sản phẩm'))}</b>\n"
+            f"Tối đa hiện tại: <b>{limit}</b>"
+        )
+    await callback.answer()
+
+
+@dp.message(QuantityStates.quantity)
+async def quantity_message_handler(message: Message, state: FSMContext) -> None:
+    remember_user(message.from_user)
+    try:
+        quantity = int(str(message.text or "").strip())
+    except ValueError:
+        await message.answer("Vui lòng nhập số nguyên dương, ví dụ: 2")
+        return
+    data = await state.get_data()
+    menu = menu_for_user(message.from_user.id)
+    if not menu or menu.key != data.get("menu_key"):
+        await state.clear()
+        await message.answer("Danh sách đã hết hạn. Chọn 📦 Sản phẩm để mở lại.", reply_markup=main_keyboard(message.from_user.id))
+        return
+    try:
+        index = int(data.get("index"))
+        product = menu.products[index]
+    except (ValueError, TypeError, IndexError):
+        await state.clear()
+        await message.answer("Sản phẩm không còn trong danh sách.", reply_markup=main_keyboard(message.from_user.id))
+        return
+    limit = min(MAX_QUANTITY, max(1, int(product.get("quantity") or 0)))
+    if quantity < 1 or quantity > limit:
+        await message.answer(f"Số lượng phải từ 1 đến {limit}. Vui lòng nhập lại.")
+        return
+    await state.clear()
+    total = int(product.get("finalPrice") or product.get("price") or 0) * quantity
+    await message.answer(
+        "🛒 <b>XÁC NHẬN ĐƠN HÀNG</b>\n"
+        f"{UI_DIVIDER}\n\n"
+        f"Sản phẩm: <b>{html.escape(str(product.get('name') or 'Sản phẩm'))}</b>\n"
+        f"Số lượng: <b>{quantity}</b>\n"
+        f"Tạm tính: <b>{money(total)}</b>\n\n"
+        "Giá cuối cùng và tồn kho sẽ được website kiểm tra lại khi thanh toán.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Chọn phương thức thanh toán", callback_data=f"payment|{menu.key}|{index}|{quantity}")],
+                [InlineKeyboardButton(text="‹ Quay lại", callback_data=f"product|{menu.key}|{index}")],
+            ]
+        ),
+    )
+
+
+@dp.callback_query(F.data.startswith("payment|"))
+async def payment_method_callback(callback: CallbackQuery) -> None:
+    if not callback.message:
+        await callback.answer()
+        return
+    parts = str(callback.data or "").split("|")
+    if len(parts) != 4:
+        await callback.answer("Dữ liệu không hợp lệ.", show_alert=True)
+        return
+    menu = menu_for_user(callback.from_user.id)
+    if not menu or menu.key != parts[1]:
+        await callback.answer("Danh sách đã cũ, vui lòng mở lại sản phẩm.", show_alert=True)
+        return
+    try:
+        index = int(parts[2])
+        quantity = int(parts[3])
+        product = menu.products[index]
+    except (ValueError, IndexError):
+        await callback.answer("Sản phẩm hoặc số lượng không hợp lệ.", show_alert=True)
+        return
+    stock = int(product.get("quantity") or 0)
+    if quantity < 1 or quantity > MAX_QUANTITY or quantity > stock:
+        await callback.answer("Số lượng hiện không còn đủ.", show_alert=True)
+        return
+    total = int(product.get("finalPrice") or product.get("price") or 0) * quantity
+    await callback.answer()
+    await edit_message_content(
+        callback.message,
+        "💳 <b>CHỌN PHƯƠNG THỨC THANH TOÁN</b>\n"
+        f"{UI_DIVIDER}\n\n"
+        f"📦 Sản phẩm: <b>{html.escape(str(product.get('name') or 'Sản phẩm'))}</b>\n"
+        f"🔢 Số lượng: <b>{quantity}</b>\n"
+        f"💵 Tổng tiền: <b>{money(total)}</b>\n\n"
+        "Bạn có thể dùng số dư sẵn có hoặc chuyển khoản QR đúng số tiền trên đơn."
+        + (
+            "\n\n🧑‍💼 Sản phẩm thủ công sẽ được admin xác nhận và giao sau khi thanh toán."
+            if str(product.get("deliveryMode") or "") == "manual"
+            else ""
+        ),
+        reply_markup=payment_method_keyboard(menu, index, quantity),
+    )
+
+
+async def show_insufficient_balance_prompt(
+    message: Message,
+    telegram_id: int,
+    menu: CatalogMenu,
+    index: int,
+    product: dict[str, Any],
+    quantity: int,
+    attempt_key: tuple[int, str, int, int],
+) -> None:
+    expected_total = int(product.get("finalPrice") or product.get("price") or 0) * quantity
+    api.invalidate_balance(telegram_id)
+    try:
+        balance_data = await api.balance(telegram_id)
+        balance = int(float(balance_data.get("balance") or 0))
+        balance_label = money(balance)
+        missing_line = f"Cần nạp thêm: <b>{money(max(0, expected_total - balance))}</b>\n"
+    except ApiError as exc:
+        LOGGER.warning("Could not refresh balance after checkout rejection: %s", exc.code)
+        balance = 0
+        balance_label = "Chưa cập nhật được"
+        missing_line = ""
+
+    order_id = new_order_id()
+    pending_purchases[telegram_id] = PendingPurchase(
+        product_id=str(product.get("id") or ""),
+        product_name=str(product.get("name") or "Sản phẩm"),
+        quantity=quantity,
+        order_id=order_id,
+        expected_total=expected_total,
+        delivery_mode=str(product.get("deliveryMode") or "provider"),
+        product_note=str(product.get("desc") or ""),
+        is_ctv=menu.is_ctv,
+    )
+    purchase_attempts.pop(attempt_key, None)
+    await edit_message_content(
+        message,
+        "💳 <b>SỐ DƯ CHƯA ĐỦ</b>\n"
+        f"{UI_DIVIDER}\n\n"
+        f"Cần thanh toán: <b>{money(expected_total)}</b>\n"
+        f"Đang có: <b>{balance_label}</b>\n"
+        f"{missing_line}\n"
+        "Chọn QR nhanh để chuyển đúng số tiền của đơn hàng, hoặc nạp một số tiền khác.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="📲 QR đúng số tiền đơn", callback_data=f"pay_qr|{menu.key}|{index}|{quantity}")],
+                [InlineKeyboardButton(text="💳 Nạp số tiền khác", callback_data="deposit")],
+                [
+                    InlineKeyboardButton(text="🏪 Kênh CTV" if menu.is_ctv else "📦 Sản phẩm", callback_data="ctv_open" if menu.is_ctv else "products"),
+                    InlineKeyboardButton(text="🏠 Trang chủ", callback_data="home"),
+                ],
+            ]
+        ),
+    )
+
+
+@dp.callback_query(F.data.startswith("confirm|"))
+@dp.callback_query(F.data.startswith("pay_balance|"))
+async def confirm_purchase_callback(callback: CallbackQuery) -> None:
+    if not callback.message:
+        await callback.answer()
+        return
+    parts = str(callback.data or "").split("|")
+    if len(parts) != 4:
+        await callback.answer("Dữ liệu không hợp lệ.", show_alert=True)
+        return
+    menu = menu_for_user(callback.from_user.id)
+    if not menu or menu.key != parts[1]:
+        await callback.answer("Danh sách đã cũ, vui lòng mở lại sản phẩm.", show_alert=True)
+        return
+    try:
+        index = int(parts[2])
+        quantity = int(parts[3])
+        product = menu.products[index]
+    except (ValueError, IndexError):
+        await callback.answer("Sản phẩm hoặc số lượng không hợp lệ.", show_alert=True)
+        return
+    if quantity < 1 or quantity > MAX_QUANTITY:
+        await callback.answer("Số lượng không hợp lệ.", show_alert=True)
+        return
+
+    attempt_key = (callback.from_user.id, menu.key, index, quantity)
+    order_id = purchase_attempts.setdefault(
+        attempt_key,
+        new_order_id(),
+    )
+    await callback.answer("Đang kiểm tra số dư và tồn kho…")
+    async with purchase_locks[callback.from_user.id]:
+        try:
+            await edit_message_content(callback.message, "⏳ <b>ĐANG XỬ LÝ ĐƠN HÀNG</b>\n\nHệ thống đang kiểm tra số dư, tồn kho và chuẩn bị tài khoản cho bạn…")
+            expected_total = int(product.get("finalPrice") or product.get("price") or 0) * quantity
+            if str(product.get("deliveryMode") or "") == "manual":
+                result = await api.manual_checkout(
+                    callback.from_user.id,
+                    str(product.get("id") or ""),
+                    order_id,
+                    quantity,
+                    ctv_mode=menu.is_ctv,
+                )
+                detail = result
+            else:
+                result = await api.checkout(callback.from_user.id, str(product.get("id") or ""), order_id, quantity, ctv_mode=menu.is_ctv)
+                api.invalidate_balance(callback.from_user.id)
+                api.invalidate_catalog()
+                detail = await fetch_order_detail(callback.from_user.id, order_id)
+            api.invalidate_balance(callback.from_user.id)
+            api.invalidate_catalog()
+            await send_purchase_result(
+                callback.from_user.id,
+                result,
+                detail,
+                str(product.get("name") or "Sản phẩm"),
+                expected_total,
+                order_id,
+                initial_message=callback.message,
+                is_ctv=menu.is_ctv,
+            )
+        except ApiError as exc:
+            LOGGER.warning(
+                "Checkout failed for order %s (%s): %s",
+                order_id,
+                exc.code,
+                exc.message,
+            )
+            if exc.code == "INSUFFICIENT_BALANCE":
+                await show_insufficient_balance_prompt(
+                    callback.message,
+                    callback.from_user.id,
+                    menu,
+                    index,
+                    product,
+                    quantity,
+                    attempt_key,
+                )
+            elif exc.code == "PROVIDER_PURCHASE_UNCERTAIN":
+                await notify_admin(
+                    "⚠️ <b>ĐƠN HÀNG CẦN KIỂM TRA</b>\n\n"
+                    f"👤 Telegram ID: <code>{callback.from_user.id}</code>\n"
+                    f"🧾 Mã đơn: <code>{html.escape(order_id)}</code>\n"
+                    f"📦 Sản phẩm: <b>{html.escape(str(product.get('name') or 'Sản phẩm'))}</b>"
+                )
+                await edit_message_content(
+                    callback.message,
+                    "⚠️ <b>ĐƠN CẦN KIỂM TRA</b>\n\n"
+                    f"Mã đơn: <code>{html.escape(order_id)}</code>\n"
+                    "Hệ thống chưa nhận được kết quả đầy đủ. Đơn đã được khóa để tránh trừ tiền hai lần.\n"
+                    "Vui lòng liên hệ admin để kiểm tra đơn này.",
+                    reply_markup=after_purchase_keyboard(menu.is_ctv),
+                )
+            else:
+                purchase_attempts.pop(attempt_key, None)
+                await edit_message_content(callback.message, f"❌ {html.escape(public_error_message(exc))}", reply_markup=after_purchase_keyboard(menu.is_ctv))
+        except Exception:
+            LOGGER.exception("Purchase handler failed")
+            await edit_message_content(
+                callback.message,
+                "❌ Có lỗi ngoài dự kiến khi xử lý đơn. Vui lòng kiểm tra mục Đơn hàng trước khi thử lại.",
+                reply_markup=after_purchase_keyboard(menu.is_ctv),
+            )
+
+
+@dp.callback_query(F.data.startswith("pay_qr|"))
+async def quick_qr_payment_callback(callback: CallbackQuery) -> None:
+    if not callback.message:
+        await callback.answer()
+        return
+    parts = str(callback.data or "").split("|")
+    if len(parts) != 4:
+        await callback.answer("Dữ liệu không hợp lệ.", show_alert=True)
+        return
+    menu = menu_for_user(callback.from_user.id)
+    if not menu or menu.key != parts[1]:
+        await callback.answer("Danh sách đã cũ, vui lòng mở lại sản phẩm.", show_alert=True)
+        return
+    try:
+        index = int(parts[2])
+        quantity = int(parts[3])
+        product = menu.products[index]
+    except (ValueError, IndexError):
+        await callback.answer("Sản phẩm hoặc số lượng không hợp lệ.", show_alert=True)
+        return
+
+    stock = int(product.get("quantity") or 0)
+    if quantity < 1 or quantity > MAX_QUANTITY or quantity > stock:
+        await callback.answer("Số lượng hiện không còn đủ.", show_alert=True)
+        return
+    expected_total = int(product.get("finalPrice") or product.get("price") or 0) * quantity
+    attempt_key = (callback.from_user.id, menu.key, index, quantity)
+    existing = pending_purchases.get(callback.from_user.id)
+    if existing and (
+        existing.product_id != str(product.get("id") or "")
+        or existing.quantity != quantity
+        or existing.is_ctv != menu.is_ctv
+    ):
+        await callback.answer("Bạn đang có một đơn khác chờ thanh toán.", show_alert=True)
+        return
+    if any(user_id == callback.from_user.id for user_id, _memo in deposit_watch_tasks):
+        await callback.answer("Bạn đang có một mã QR chờ thanh toán. Hãy dùng mã QR trước đó.", show_alert=True)
+        return
+
+    order_id = existing.order_id if existing else purchase_attempts.setdefault(attempt_key, new_order_id())
+    pending = existing or PendingPurchase(
+        product_id=str(product.get("id") or ""),
+        product_name=str(product.get("name") or "Sản phẩm"),
+        quantity=quantity,
+        order_id=order_id,
+        expected_total=expected_total,
+        delivery_mode=str(product.get("deliveryMode") or "provider"),
+        product_note=str(product.get("desc") or ""),
+        is_ctv=menu.is_ctv,
+    )
+    await callback.answer("Đang tạo QR thanh toán…")
+    try:
+        await edit_message_content(
+            callback.message,
+            "⏳ <b>ĐANG TẠO QR THANH TOÁN</b>\n\n"
+            f"Số tiền đơn hàng: <b>{money(expected_total)}</b>"
+        )
+        await create_and_send_deposit_qr(
+            callback.message,
+            callback.from_user.id,
+            expected_total,
+            pending=pending,
+        )
+    except ApiError as exc:
+        await edit_message_content(
+            callback.message,
+            f"❌ {html.escape(public_error_message(exc))}",
+            reply_markup=after_purchase_keyboard(menu.is_ctv),
+        )
+
+
+@dp.callback_query(F.data == "products")
+async def products_callback(callback: CallbackQuery) -> None:
+    await callback.answer()
+    if callback.message:
+        await show_catalog(callback.message, edit=True, telegram_id=callback.from_user.id)
+
+
+@dp.callback_query(F.data == "home")
+async def home_callback(callback: CallbackQuery) -> None:
+    await callback.answer()
+    if callback.message:
+        await show_home(
+            callback.message,
+            edit=True,
+            telegram_id=callback.from_user.id,
+            display_name=callback.from_user.full_name,
+        )
+
+
+@dp.callback_query(F.data == "balance")
+async def balance_callback(callback: CallbackQuery) -> None:
+    await callback.answer()
+    if callback.message:
+        await balance_handler(callback.message, callback.from_user.id)
+
+
+@dp.callback_query(F.data == "orders")
+async def orders_callback(callback: CallbackQuery) -> None:
+    await callback.answer()
+    if callback.message:
+        await orders_handler(callback.message, callback.from_user.id)
+
+
+@dp.callback_query(F.data == "deposit")
+async def deposit_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    if callback.message:
+        await deposit_handler(callback.message, state, callback.from_user.id)
+
+
+# ---------------------------------------------------------------------------
+# SePay webhook: /sepay/webhook
+# ---------------------------------------------------------------------------
+
+def normalize_payment_text(value: str) -> str:
+    return "".join(char.lower() for char in str(value or "") if char.isalnum())
+
+
+def extract_payment_fields(payload: Any) -> tuple[int, str, str]:
+    if not isinstance(payload, dict):
+        return 0, "", ""
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    if isinstance(data.get("transfer"), dict):
+        data = data["transfer"]
+    amount = 0
+    content = ""
+    transaction_id = ""
+    for key in ("transferAmount", "amount", "transfer_amount", "creditAmount", "transactionAmount", "incomingAmount"):
+        value = data.get(key)
+        if value is None:
+            continue
+        try:
+            amount = int(float(str(value).replace(",", "").strip()))
+            if amount > 0:
+                break
+        except (TypeError, ValueError):
+            pass
+    content_parts: list[str] = []
+    for key in ("content", "description", "transferContent", "transactionContent", "referenceCode"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            content_parts.append(value.strip())
+    content = " ".join(dict.fromkeys(content_parts))[:4000]
+    for key in ("id", "transaction_id", "transactionId", "reference", "code"):
+        value = data.get(key)
+        if value is not None and str(value).strip():
+            transaction_id = str(value).strip()
+            break
+    return amount, content, transaction_id
+
+
+def webhook_authorized(request: Request) -> bool:
+    if not WEBHOOK_TOKEN:
+        return True
+    supplied = request.headers.get("x-webhook-token", "")
+    if not supplied:
+        auth = request.headers.get("authorization", "")
+        supplied = auth.removeprefix("Bearer ").strip()
+    return bool(supplied) and hmac.compare_digest(supplied, WEBHOOK_TOKEN)
+
+
+async def forward_sepay_event(payload: Any, request: Request) -> bool:
+    """Chuyển giao dịch chưa khớp sang webhook của bot còn lại."""
+    if not SEPAY_FORWARD_URL or request.headers.get("x-sepay-forwarded") == "1":
+        return False
+    headers = {"X-Sepay-Forwarded": "1"}
+    if WEBHOOK_TOKEN:
+        headers["X-Webhook-Token"] = WEBHOOK_TOKEN
+    target_url = SEPAY_FORWARD_URL.rstrip("/")
+    if not target_url.endswith("/sepay/webhook"):
+        target_url += "/sepay/webhook"
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            response = await client.post(
+                target_url,
+                json=payload,
+                headers=headers,
+            )
+        if response.status_code < 200 or response.status_code >= 300:
+            LOGGER.warning("Forwarded SePay event failed with HTTP %s", response.status_code)
+            return False
+        LOGGER.info("Forwarded unmatched SePay event to secondary bot")
+        return True
+    except httpx.HTTPError:
+        LOGGER.exception("Could not forward SePay event to secondary bot")
+        return False
+
+
+@app.get("/")
+async def root() -> dict[str, Any]:
+    return {"ok": True, "service": "telegram-account-shop"}
+
+
+@app.get("/sepay/webhook")
+async def sepay_webhook_get() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "message": "SePay webhook endpoint is alive. Use POST.",
+        "memoFormat": "Chuyentien_12345",
+        "acceptsLegacyMemo": True,
+    }
+
+
+@app.post("/sepay/webhook")
+async def sepay_webhook_post(request: Request) -> dict[str, Any]:
+    if not webhook_authorized(request):
+        return {"ok": False, "message": "unauthorized"}
+    try:
+        payload = await request.json()
+    except Exception:
+        return {"ok": False, "message": "invalid json"}
+    amount, content, transaction_id = extract_payment_fields(payload)
+    if amount <= 0 or not content:
+        forwarded = await forward_sepay_event(payload, request)
+        return {"ok": True, "message": "forwarded" if forwarded else "ignored"}
+
+    # Mã nạp mới có dạng Chuyentien_<5 chữ số>; chấp nhận cả ngân hàng bỏ dấu _ hoặc thêm khoảng trắng.
+    normalized_content = normalize_payment_text(content)
+    new_memo_match = re.search(r"chuyentien(\d{5})(?!\d)", normalized_content, re.IGNORECASE)
+    if new_memo_match:
+        memo = f"Chuyentien_{new_memo_match.group(1)}"
+        try:
+            LOGGER.info("SePay deposit matched Telegram memo %s", memo)
+            result = await api.confirm_deposit_by_memo(memo, amount, transaction_id or "sepay")
+            if result.get("processed"):
+                telegram_id = int(result.get("telegramId") or 0)
+                if telegram_id:
+                    await notify_deposit_paid(telegram_id, {**result, "memo": memo, "amount": amount})
+            return {"ok": True, "message": "processed" if result.get("processed") else "already processed"}
+        except ApiError as exc:
+            LOGGER.warning("SePay confirmation failed for %s: %s", memo, exc.code)
+            return {"ok": False, "message": exc.code}
+
+    legacy_memo_match = re.search(r"(TG(\d{1,30})_[A-Za-z0-9]+_[A-Za-z0-9]+)", content, re.IGNORECASE)
+    if not legacy_memo_match:
+        forwarded = await forward_sepay_event(payload, request)
+        return {"ok": True, "message": "forwarded" if forwarded else "not a telegram deposit"}
+    memo = legacy_memo_match.group(1)
+    telegram_id = int(legacy_memo_match.group(2))
+    try:
+        result = await api.confirm_deposit(telegram_id, memo, amount, transaction_id or "sepay")
+        if result.get("processed"):
+            await notify_deposit_paid(telegram_id, {**result, "memo": memo, "amount": amount})
+        return {"ok": True, "message": "processed" if result.get("processed") else "already processed"}
+    except ApiError as exc:
+        LOGGER.warning("SePay confirmation failed for %s: %s", memo, exc.code)
+        return {"ok": False, "message": exc.code}
+
+
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
+
+async def run_web() -> None:
+    config = uvicorn.Config(app, host="0.0.0.0", port=PORT, log_level="info")
+    server = uvicorn.Server(config)
+    await server.serve()
+
+
+async def main() -> None:
+    global bot
+    if not BOT_TOKEN:
+        raise RuntimeError("Thiếu BOT_TOKEN trong biến môi trường.")
+    if not WEB_API_BASE_URL:
+        raise RuntimeError("Thiếu WEB_API_BASE_URL trong biến môi trường.")
+    if len(TELEGRAM_BOT_SHARED_SECRET) < 32:
+        raise RuntimeError("TELEGRAM_BOT_SHARED_SECRET phải có ít nhất 32 ký tự.")
+    if not ADMIN_TELEGRAM_IDS:
+        LOGGER.warning("No Telegram admin ID configured; /admin will be unavailable.")
+    init_db()
+    await sync_product_badges_from_api()
+    backup_database()
+    backup_task = asyncio.create_task(database_backup_loop())
+    daily_backup_task = asyncio.create_task(daily_database_backup_loop())
+    stock_watch_task = asyncio.create_task(provider_stock_watch_loop())
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    try:
+        await bot.set_my_commands(
+            [
+                BotCommand(command="start", description="Mở menu chính"),
+                BotCommand(command="home", description="Về trang chủ"),
+                BotCommand(command="products", description="Xem tài khoản đang bán"),
+                BotCommand(command="deposit", description="Nạp tiền tự động"),
+                BotCommand(command="balance", description="Xem số dư"),
+                BotCommand(command="orders", description="Xem đơn hàng"),
+                BotCommand(command="help", description="Hướng dẫn mua hàng"),
+                BotCommand(command="support", description="Liên hệ hỗ trợ"),
+                BotCommand(command="admin", description="Quản trị shop"),
+                BotCommand(command="users", description="Danh sách khách hàng"),
+                BotCommand(command="money", description="Cộng hoặc trừ số dư khách"),
+                BotCommand(command="badges", description="Gán icon sản phẩm"),
+                BotCommand(command="broadcast", description="Gửi thông báo cho khách"),
+                BotCommand(command="backup", description="Gửi backup dữ liệu"),
+            ]
+        )
+        LOGGER.info("Starting Telegram account shop bot")
+        await asyncio.gather(
+            dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types()),
+            run_web(),
+        )
+    finally:
+        backup_task.cancel()
+        daily_backup_task.cancel()
+        stock_watch_task.cancel()
+        try:
+            await asyncio.gather(backup_task, daily_backup_task, stock_watch_task)
+        except asyncio.CancelledError:
+            pass
+        await asyncio.to_thread(backup_database)
+        for task in deposit_watch_tasks.values():
+            task.cancel()
+        await api.close()
+        await bot.session.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
