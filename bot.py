@@ -281,6 +281,9 @@ class WebApi:
     async def admin_stats(self, telegram_id: int) -> dict[str, Any]:
         return await self.request("GET", "/telegram/admin/stats", telegram_id)
 
+    async def admin_provider_balances(self, telegram_id: int) -> dict[str, Any]:
+        return await self.request("GET", "/telegram/admin/provider-balances", telegram_id)
+
     async def product_badges(self, telegram_id: int) -> dict[str, str]:
         result = await self.request("GET", "/telegram/admin/product-badges", telegram_id)
         badges = result.get("badges") if isinstance(result.get("badges"), dict) else {}
@@ -1942,6 +1945,7 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📊 Làm mới thống kê", callback_data="admin_dashboard")],
+            [InlineKeyboardButton(text="💳 Số dư nguồn API", callback_data="admin_provider_balances")],
             [InlineKeyboardButton(text="👥 Danh sách khách hàng", callback_data="admin_users")],
             [InlineKeyboardButton(text="💸 Cộng / trừ số dư", callback_data="admin_balance_adjust")],
             [InlineKeyboardButton(text="📣 Gửi thông báo", callback_data="admin_broadcast")],
@@ -2107,6 +2111,33 @@ async def admin_dashboard_view(admin_id: int) -> tuple[str, InlineKeyboardMarkup
     dashboard_buttons = [[InlineKeyboardButton(text="👥 Xem danh sách khách hàng", callback_data="admin_users")]]
     dashboard_buttons.extend(admin_keyboard().inline_keyboard)
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=dashboard_buttons)
+
+
+async def admin_provider_balances_view(admin_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    data = await api.admin_provider_balances(admin_id)
+    providers = [item for item in data.get("providers", []) if isinstance(item, dict)]
+    lines = [
+        "💳 <b>SỐ DƯ NGUỒN API</b>",
+        UI_DIVIDER,
+        "Số dư được lấy trực tiếp từ nhà cung cấp khi mở trang này.",
+        "",
+    ]
+    if not providers:
+        lines.append("Chưa có nguồn API nào đang bật trong trang quản trị web.")
+    else:
+        for provider in providers:
+            lines.append(f"🔹 <b>{html.escape(str(provider.get('label') or 'Nguồn API'))}</b>")
+            if provider.get("connected"):
+                display = str(provider.get("balanceDisplay") or "Đã kết nối")
+                lines.append(f"   {html.escape(display)}")
+            else:
+                lines.append(f"   ⚠️ {html.escape(str(provider.get('error') or 'Không đọc được số dư.'))}")
+            lines.append("")
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Làm mới số dư", callback_data="admin_provider_balances")],
+        [InlineKeyboardButton(text="↩️ Quản trị", callback_data="admin_dashboard")],
+    ])
+    return "\n".join(lines).rstrip(), keyboard
 
 
 async def admin_users_view(admin_id: int, page: int = 1) -> tuple[str, InlineKeyboardMarkup]:
@@ -2460,6 +2491,25 @@ async def admin_dashboard_callback(callback: CallbackQuery) -> None:
     except ApiError as exc:
         if callback.message:
             await callback.message.answer(f"⚠️ {html.escape(public_error_message(exc))}")
+
+
+@dp.callback_query(F.data == "admin_provider_balances")
+async def admin_provider_balances_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Bạn không có quyền.", show_alert=True)
+        return
+    await callback.answer("Đang đọc số dư nguồn API…")
+    try:
+        if callback.message:
+            text, markup = await admin_provider_balances_view(callback.from_user.id)
+            await callback.message.edit_text(text, reply_markup=markup)
+    except ApiError as exc:
+        if callback.message:
+            await callback.message.answer(f"⚠️ {html.escape(public_error_message(exc))}")
+    except Exception:
+        LOGGER.exception("Could not read provider balances for admin %s", callback.from_user.id)
+        if callback.message:
+            await callback.message.answer("⚠️ Chưa đọc được số dư nguồn API. Hãy thử lại sau.")
 
 
 @dp.callback_query(F.data.startswith("admin_users"))

@@ -139,7 +139,7 @@ Nếu dùng chung một tài khoản ngân hàng cho bot bán tài khoản và b
 Chỉ dùng bot để phân phối tài khoản mà bạn có quyền bán hoặc phân phối.
 # Nguồn DuckyStore Locket Gold
 
-Website hỗ trợ thêm API CTV DuckyStore như một nguồn giao hàng tự động. Trong trang quản trị, vào **Nguồn API**, chọn **DuckyStore — Locket Gold CTV**, đặt tên nguồn và nhập API key lấy từ bot DuckyStore. Key được thử kết nối qua `/api/v1/me`, mã hóa ở backend Netlify và không gửi lại cho trình duyệt. Cấu hình `PROVIDER_MASTER_KEY` trên Netlify vẫn cần có trước khi lưu key.
+Website hỗ trợ thêm API CTV DuckyStore như một nguồn giao hàng tự động. Trong trang quản trị, vào **Nguồn API**, chọn **DuckyStore — Locket Gold CTV**, đặt tên nguồn và nhập API key lấy từ bot DuckyStore. Khi kết nối, web đọc cả `balance_money` và `balance_slots` từ `/api/v1/me` (nếu máy chủ trả 404 thì thử `/api/v1/ctv/me`), mã hóa key ở backend Netlify và không gửi lại cho trình duyệt. Cấu hình `PROVIDER_MASTER_KEY` trên Netlify vẫn cần có trước khi lưu key. Admin Telegram có thể mở **Quản trị → Số dư nguồn API** để đọc lại số dư và lượt trực tiếp từ nguồn.
 
 Khi tạo hoặc sửa sản phẩm, chọn **Nguồn API**, chọn nguồn DuckyStore và gói Gold cần bán. Số lượng khả dụng được tính theo số lượt còn trong ví CTV và số lượt gói cần. Nhập giá bán web, giá Telegram hoặc giá CTV theo kênh muốn mở. Có thể chuyển sản phẩm sang **Thủ công** bất kỳ lúc nào; đơn thủ công tiếp tục chờ admin giao như luồng hiện có.
 
