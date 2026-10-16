@@ -137,3 +137,12 @@ Có thể mở đường dẫn trên bằng trình duyệt để kiểm tra bot 
 Nếu dùng chung một tài khoản ngân hàng cho bot bán tài khoản và bot OTP, SePay chỉ cần trỏ tới một URL. Trên bot nhận webhook chính, đặt `SEPAY_FORWARD_URL` bằng URL public của bot còn lại. Hai bot phải dùng cùng `SEPAY_WEBHOOK_TOKEN` nếu biến này được bật. Mỗi bot chỉ xử lý đúng loại đơn của mình, giao dịch chưa khớp sẽ được chuyển tiếp một lần.
 
 Chỉ dùng bot để phân phối tài khoản mà bạn có quyền bán hoặc phân phối.
+# Nguồn DuckyStore Locket Gold
+
+Website hỗ trợ thêm API CTV DuckyStore như một nguồn giao hàng tự động. Trong trang quản trị, vào **Nguồn API**, chọn **DuckyStore — Locket Gold CTV**, đặt tên nguồn và nhập API key lấy từ bot DuckyStore. Key được thử kết nối qua `/api/v1/me`, mã hóa ở backend Netlify và không gửi lại cho trình duyệt. Cấu hình `PROVIDER_MASTER_KEY` trên Netlify vẫn cần có trước khi lưu key.
+
+Khi tạo hoặc sửa sản phẩm, chọn **Nguồn API**, chọn nguồn DuckyStore và gói Gold cần bán. Số lượng khả dụng được tính theo số lượt còn trong ví CTV và số lượt gói cần. Nhập giá bán web, giá Telegram hoặc giá CTV theo kênh muốn mở. Có thể chuyển sản phẩm sang **Thủ công** bất kỳ lúc nào; đơn thủ công tiếp tục chờ admin giao như luồng hiện có.
+
+Trước khi thanh toán, khách nhập username Locket hoặc link profile. Website và bot Telegram chuyển username tới backend; backend mới gọi API cấp Gold và chỉ đánh dấu đơn hoàn tất khi nhận phản hồi thành công. Với đơn Telegram, bot hỏi username trước khi hiển thị phương thức thanh toán và lưu username trong đơn QR đang chờ.
+
+Tài liệu DuckyStore hiện hiển thị hai đường dẫn cấp Gold: `/api/v1/grant` trong code mẫu và `/api/v1/ctv/gold` trong bảng endpoint. Backend thử `/grant` trước và chỉ chuyển sang `/ctv/gold` nếu endpoint đầu trả HTTP 404. Request gửi `testflight: false` để dùng đúng số lượt được ghi ở gói; khách vẫn cần kiểm tra username trước khi xác nhận. API key không cần đặt trong mã nguồn bot hoặc frontend.

@@ -92,7 +92,7 @@ MIN_DEPOSIT = max(0, int(os.getenv("MIN_DEPOSIT", "0")))
 DEPOSIT_WATCH_SECONDS = max(60, int(os.getenv("DEPOSIT_WATCH_SECONDS", "900")))
 DEPOSIT_POLL_SECONDS = max(3, int(os.getenv("DEPOSIT_POLL_SECONDS", "5")))
 CATALOG_CACHE_TTL_SECONDS = 8
-PROVIDER_STOCK_POLL_SECONDS = max(30, int(os.getenv("PROVIDER_STOCK_POLL_SECONDS", "60")))
+PROVIDER_STOCK_POLL_SECONDS = max(15, int(os.getenv("PROVIDER_STOCK_POLL_SECONDS", "20")))
 SUPPORT_HANDLE = os.getenv("SUPPORT_TELEGRAM", "@tai_khoan_xin").strip() or "@tai_khoan_xin"
 HTTP_TIMEOUT = httpx.Timeout(20.0, connect=8.0)
 HTTP_LIMITS = httpx.Limits(max_connections=100, max_keepalive_connections=20, keepalive_expiry=30.0)
@@ -110,6 +110,10 @@ class DepositStates(StatesGroup):
 
 class QuantityStates(StatesGroup):
     quantity = State()
+
+
+class LocketStates(StatesGroup):
+    username = State()
 
 
 class AdminStates(StatesGroup):
@@ -240,7 +244,7 @@ class WebApi:
     async def orders(self, telegram_id: int) -> dict[str, Any]:
         return await self.request("GET", "/user/orders", telegram_id)
 
-    async def checkout(self, telegram_id: int, product_id: str, order_id: str, quantity: int, *, ctv_mode: bool = False) -> dict[str, Any]:
+    async def checkout(self, telegram_id: int, product_id: str, order_id: str, quantity: int, *, ctv_mode: bool = False, locket_username: str = "") -> dict[str, Any]:
         return await self.request(
             "POST",
             "/provider/checkout",
@@ -250,6 +254,7 @@ class WebApi:
                 "orderId": order_id,
                 "quantity": quantity,
                 "salesChannel": "ctv" if ctv_mode else "retail",
+                "locketUsername": locket_username,
             },
         )
 
@@ -287,6 +292,11 @@ class WebApi:
             await self.request("PUT", path, telegram_id, payload={"badge": badge})
         else:
             await self.request("DELETE", path, telegram_id)
+
+    async def price_protection_alerts(self, telegram_id: int) -> list[dict[str, Any]]:
+        result = await self.request("GET", "/telegram/admin/price-protection-alerts", telegram_id)
+        alerts = result.get("alerts")
+        return [item for item in alerts if isinstance(item, dict)] if isinstance(alerts, list) else []
 
     async def update_profile(self, telegram_id: int, display_name: str, username: str) -> None:
         await self.request(
@@ -360,6 +370,7 @@ class PendingPurchase:
     delivery_mode: str = "provider"
     product_note: str = ""
     is_ctv: bool = False
+    locket_username: str = ""
 
 
 api = WebApi(WEB_API_BASE_URL, TELEGRAM_BOT_SHARED_SECRET)
@@ -370,6 +381,7 @@ app = FastAPI(title="Telegram account shop webhook")
 menus: dict[int, CatalogMenu] = {}
 purchase_attempts: dict[tuple[int, str, int, int], str] = {}
 pending_purchases: dict[int, PendingPurchase] = {}
+pending_locket_usernames: dict[int, tuple[str, int, int, str]] = {}
 purchase_locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 deposit_watch_tasks: dict[tuple[int, str], asyncio.Task[Any]] = {}
 deposit_notified: set[tuple[int, str]] = set()
@@ -1137,6 +1149,13 @@ def menu_for_user(user_id: int) -> CatalogMenu | None:
     return menu
 
 
+def locket_username_for(user_id: int, menu_key: str, index: int, quantity: int) -> str:
+    entry = pending_locket_usernames.get(int(user_id))
+    if not entry or entry[:3] != (str(menu_key), int(index), int(quantity)):
+        return ""
+    return entry[3]
+
+
 def catalog_keyboard(menu: CatalogMenu, page: int) -> InlineKeyboardMarkup:
     total_pages = max(1, (len(menu.products) + CATALOG_PAGE_SIZE - 1) // CATALOG_PAGE_SIZE)
     page = max(0, min(page, total_pages - 1))
@@ -1517,24 +1536,28 @@ async def send_purchase_result(
         delivery_text = account_details
     delivery_text = delivery_text[:12000]
     escaped_delivery_text = html.escape(delivery_text)
+    is_locket_order = str(detail.get("providerType") or "") == "duckystore"
     summary = (
-        "✅ <b>MUA TÀI KHOẢN THÀNH CÔNG</b>\n\n"
-        f"🧾 Mã đơn: <code>{html.escape(order_id)}</code>\n"
-        f"📦 Sản phẩm: <b>{html.escape(str(detail.get('productName') or fallback_product_name or 'Sản phẩm'))}</b>\n"
-        f"🔢 Số lượng: <b>{int(detail.get('deliveredQuantity') or len(accounts))}</b>\n"
-        f"💵 Thanh toán: <b>{money(detail.get('price') or result.get('totalAmount') or expected_total)}</b>\n\n"
-        "🔐 <b>THÔNG TIN TÀI KHOẢN</b>\n"
-        f"{support_line()}"
+        ("✅ <b>KÍCH HOẠT LOCKET GOLD THÀNH CÔNG</b>\n\n" if is_locket_order else "✅ <b>MUA TÀI KHOẢN THÀNH CÔNG</b>\n\n")
+        + f"🧾 Mã đơn: <code>{html.escape(order_id)}</code>\n"
+        + f"📦 Sản phẩm: <b>{html.escape(str(detail.get('productName') or fallback_product_name or 'Sản phẩm'))}</b>\n"
+        + (f"👤 Username Locket: <code>{html.escape(str(detail.get('locketUsername') or ''))}</code>\n" if is_locket_order else "")
+        + f"🔢 Số lượng: <b>{int(detail.get('deliveredQuantity') or len(accounts))}</b>\n"
+        + f"💵 Thanh toán: <b>{money(detail.get('price') or result.get('totalAmount') or expected_total)}</b>\n\n"
+        + ("✨ Gold đã được cấp cho tài khoản Locket.\n" if is_locket_order else "🔐 <b>THÔNG TIN TÀI KHOẢN</b>\n")
+        + f"{support_line()}"
     )
     if initial_message:
         await edit_message_content(initial_message, summary, reply_markup=after_purchase_keyboard(is_ctv))
         target = initial_message
-        for chunk_start in range(0, len(escaped_delivery_text), 3800):
-            await target.answer(f"<pre>{escaped_delivery_text[chunk_start : chunk_start + 3800]}</pre>")
+        if not is_locket_order:
+            for chunk_start in range(0, len(escaped_delivery_text), 3800):
+                await target.answer(f"<pre>{escaped_delivery_text[chunk_start : chunk_start + 3800]}</pre>")
     elif bot:
         await bot.send_message(telegram_id, summary, reply_markup=after_purchase_keyboard(is_ctv))
-        for chunk_start in range(0, len(escaped_delivery_text), 3800):
-            await bot.send_message(telegram_id, f"<pre>{escaped_delivery_text[chunk_start : chunk_start + 3800]}</pre>")
+        if not is_locket_order:
+            for chunk_start in range(0, len(escaped_delivery_text), 3800):
+                await bot.send_message(telegram_id, f"<pre>{escaped_delivery_text[chunk_start : chunk_start + 3800]}</pre>")
     if order_id not in admin_notified_orders:
         admin_notified_orders.add(order_id)
         await notify_admin_order_with_accounts(
@@ -1561,7 +1584,14 @@ async def resume_pending_purchase(telegram_id: int, pending: PendingPurchase) ->
             result = await api.manual_checkout(telegram_id, pending.product_id, pending.order_id, pending.quantity, ctv_mode=pending.is_ctv)
             detail = result
         else:
-            result = await api.checkout(telegram_id, pending.product_id, pending.order_id, pending.quantity, ctv_mode=pending.is_ctv)
+            result = await api.checkout(
+                telegram_id,
+                pending.product_id,
+                pending.order_id,
+                pending.quantity,
+                ctv_mode=pending.is_ctv,
+                locket_username=pending.locket_username,
+            )
             api.invalidate_balance(telegram_id)
             api.invalidate_catalog()
             detail = await fetch_order_detail(telegram_id, pending.order_id)
@@ -1576,6 +1606,7 @@ async def resume_pending_purchase(telegram_id: int, pending: PendingPurchase) ->
             pending.order_id,
             is_ctv=pending.is_ctv,
         )
+        pending_locket_usernames.pop(telegram_id, None)
     except ApiError as exc:
         LOGGER.warning(
             "Checkout failed for order %s (%s): %s",
@@ -2795,6 +2826,49 @@ async def send_provider_restock_notifications(
         await notify_admin(content)
 
 
+_PRICE_PROTECTION_CHANNEL_LABELS = {
+    "web": "Web",
+    "telegram": "Telegram",
+    "ctv": "CTV",
+}
+
+
+async def send_price_protection_alerts(alerts: list[dict[str, Any]]) -> None:
+    if not alerts:
+        return
+    blocks: list[str] = []
+    for alert in alerts:
+        product_name = html.escape(str(alert.get("productName") or "Sản phẩm"))
+        provider_cost = int(float(alert.get("providerCost") or 0))
+        raised_channels = alert.get("raisedChannels")
+        if not isinstance(raised_channels, list):
+            continue
+        lines = []
+        for change in raised_channels:
+            if not isinstance(change, dict):
+                continue
+            channel_label = _PRICE_PROTECTION_CHANNEL_LABELS.get(str(change.get("channel") or ""), "?")
+            from_price = int(float(change.get("from") or 0))
+            to_price = int(float(change.get("to") or 0))
+            lines.append(f"  • {channel_label}: {money(from_price)} → {money(to_price)}")
+        if not lines:
+            continue
+        blocks.append(
+            f"🛍 <b>{product_name}</b>\n"
+            f"💰 Giá nhập mới: <b>{money(provider_cost)}</b>\n"
+            + "\n".join(lines)
+        )
+    if not blocks:
+        return
+    text = (
+        "⚠️ <b>GIÁ NHẬP NGUỒN VỪA TĂNG VƯỢT GIÁ BÁN</b>\n"
+        f"{UI_DIVIDER}\n"
+        "Hệ thống đã tự nâng giá bán để tránh lỗ. Vui lòng kiểm tra lại giá cho phù hợp.\n\n"
+        + "\n\n".join(blocks)
+    )
+    await notify_admin(text)
+
+
 async def provider_stock_watch_loop() -> None:
     while True:
         try:
@@ -2842,6 +2916,14 @@ async def provider_stock_watch_loop() -> None:
                 if changes:
                     LOGGER.info("Detected provider restock for %s products", len(changes))
                     await send_provider_restock_notifications(changes, watcher_id)
+
+            try:
+                alerts = await api.price_protection_alerts(watcher_id)
+            except ApiError as exc:
+                LOGGER.warning("Could not load price protection alerts: %s", exc.code)
+                alerts = []
+            if alerts:
+                await send_price_protection_alerts(alerts)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -3196,7 +3278,7 @@ async def quantity_callback(callback: CallbackQuery, state: FSMContext) -> None:
     except (ValueError, IndexError):
         await callback.answer("Sản phẩm không còn trong danh sách.", show_alert=True)
         return
-    limit = min(MAX_QUANTITY, max(1, int(product.get("quantity") or 0)))
+    limit = 1 if str(product.get("providerType") or "") == "duckystore" else min(MAX_QUANTITY, max(1, int(product.get("quantity") or 0)))
     await state.set_state(QuantityStates.quantity)
     await state.update_data(menu_key=menu.key, index=index)
     if callback.message:
@@ -3228,7 +3310,7 @@ async def quantity_message_handler(message: Message, state: FSMContext) -> None:
         await state.clear()
         await message.answer("Sản phẩm không còn trong danh sách.", reply_markup=main_keyboard(message.from_user.id))
         return
-    limit = min(MAX_QUANTITY, max(1, int(product.get("quantity") or 0)))
+    limit = 1 if str(product.get("providerType") or "") == "duckystore" else min(MAX_QUANTITY, max(1, int(product.get("quantity") or 0)))
     if quantity < 1 or quantity > limit:
         await message.answer(f"Số lượng phải từ 1 đến {limit}. Vui lòng nhập lại.")
         return
@@ -3250,8 +3332,50 @@ async def quantity_message_handler(message: Message, state: FSMContext) -> None:
     )
 
 
+@dp.message(LocketStates.username)
+async def locket_username_message_handler(message: Message, state: FSMContext) -> None:
+    remember_user(message.from_user)
+    username_lines = str(message.text or "").strip().splitlines()
+    raw_username = username_lines[0][:160] if username_lines else ""
+    username = raw_username.lstrip("@").strip()
+    if username.startswith(("https://", "http://")):
+        try:
+            username = username.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
+        except Exception:
+            username = ""
+    if not re.fullmatch(r"[\w.-]{2,120}", username, flags=re.UNICODE):
+        await message.answer("Username hoặc link Locket chưa hợp lệ. Hãy gửi lại, ví dụ <code>nguyenvana</code>.")
+        return
+    data = await state.get_data()
+    menu = menu_for_user(message.from_user.id)
+    if not menu or menu.key != data.get("menu_key"):
+        await state.clear()
+        await message.answer("Danh sách đã hết hạn. Chọn 📦 Sản phẩm để mở lại.", reply_markup=main_keyboard(message.from_user.id))
+        return
+    try:
+        index = int(data.get("index"))
+        quantity = int(data.get("quantity"))
+        product = menu.products[index]
+    except (ValueError, TypeError, IndexError):
+        await state.clear()
+        await message.answer("Sản phẩm không còn trong danh sách.", reply_markup=main_keyboard(message.from_user.id))
+        return
+    pending_locket_usernames[message.from_user.id] = (menu.key, index, quantity, username)
+    await state.clear()
+    total = int(product.get("finalPrice") or product.get("price") or 0) * quantity
+    await message.answer(
+        "💳 <b>CHỌN PHƯƠNG THỨC THANH TOÁN</b>\n"
+        f"{UI_DIVIDER}\n\n"
+        f"📦 Gói: <b>{html.escape(str(product.get('name') or 'Locket Gold'))}</b>\n"
+        f"👤 Locket: <code>{html.escape(username)}</code>\n"
+        f"💵 Tổng tiền: <b>{money(total)}</b>\n\n"
+        "Kiểm tra username trước khi thanh toán. API sẽ kích hoạt Gold cho tài khoản này.",
+        reply_markup=payment_method_keyboard(menu, index, quantity),
+    )
+
+
 @dp.callback_query(F.data.startswith("payment|"))
-async def payment_method_callback(callback: CallbackQuery) -> None:
+async def payment_method_callback(callback: CallbackQuery, state: FSMContext) -> None:
     if not callback.message:
         await callback.answer()
         return
@@ -3273,6 +3397,15 @@ async def payment_method_callback(callback: CallbackQuery) -> None:
     stock = int(product.get("quantity") or 0)
     if quantity < 1 or quantity > MAX_QUANTITY or quantity > stock:
         await callback.answer("Số lượng hiện không còn đủ.", show_alert=True)
+        return
+    if str(product.get("providerType") or "") == "duckystore" and not locket_username_for(callback.from_user.id, menu.key, index, quantity):
+        await state.set_state(LocketStates.username)
+        await state.update_data(menu_key=menu.key, index=index, quantity=quantity)
+        await callback.answer()
+        await callback.message.answer(
+            "👤 Gửi username Locket cần kích hoạt (hoặc link profile).\n"
+            "Hãy kiểm tra chính xác trước khi thanh toán."
+        )
         return
     total = int(product.get("finalPrice") or product.get("price") or 0) * quantity
     await callback.answer()
@@ -3325,6 +3458,7 @@ async def show_insufficient_balance_prompt(
         delivery_mode=str(product.get("deliveryMode") or "provider"),
         product_note=str(product.get("desc") or ""),
         is_ctv=menu.is_ctv,
+        locket_username=locket_username_for(telegram_id, menu.key, index, quantity),
     )
     purchase_attempts.pop(attempt_key, None)
     await edit_message_content(
@@ -3393,7 +3527,14 @@ async def confirm_purchase_callback(callback: CallbackQuery) -> None:
                 )
                 detail = result
             else:
-                result = await api.checkout(callback.from_user.id, str(product.get("id") or ""), order_id, quantity, ctv_mode=menu.is_ctv)
+                result = await api.checkout(
+                    callback.from_user.id,
+                    str(product.get("id") or ""),
+                    order_id,
+                    quantity,
+                    ctv_mode=menu.is_ctv,
+                    locket_username=locket_username_for(callback.from_user.id, menu.key, index, quantity),
+                )
                 api.invalidate_balance(callback.from_user.id)
                 api.invalidate_catalog()
                 detail = await fetch_order_detail(callback.from_user.id, order_id)
@@ -3409,6 +3550,7 @@ async def confirm_purchase_callback(callback: CallbackQuery) -> None:
                 initial_message=callback.message,
                 is_ctv=menu.is_ctv,
             )
+            pending_locket_usernames.pop(callback.from_user.id, None)
         except ApiError as exc:
             LOGGER.warning(
                 "Checkout failed for order %s (%s): %s",
@@ -3442,6 +3584,7 @@ async def confirm_purchase_callback(callback: CallbackQuery) -> None:
                     reply_markup=after_purchase_keyboard(menu.is_ctv),
                 )
             else:
+                pending_locket_usernames.pop(callback.from_user.id, None)
                 purchase_attempts.pop(attempt_key, None)
                 await edit_message_content(callback.message, f"❌ {html.escape(public_error_message(exc))}", reply_markup=after_purchase_keyboard(menu.is_ctv))
         except Exception:
@@ -3502,6 +3645,7 @@ async def quick_qr_payment_callback(callback: CallbackQuery) -> None:
         delivery_mode=str(product.get("deliveryMode") or "provider"),
         product_note=str(product.get("desc") or ""),
         is_ctv=menu.is_ctv,
+        locket_username=locket_username_for(callback.from_user.id, menu.key, index, quantity),
     )
     await callback.answer("Đang tạo QR thanh toán…")
     try:
